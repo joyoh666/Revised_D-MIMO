@@ -81,3 +81,19 @@ class ReplayBuffer:
             torch.from_numpy(self.next_h[idx]).float().to(device),
             torch.from_numpy(self.dones[idx]).float().to(device)
         )
+
+class MLPQNetwork(nn.Module):
+    def __init__(self, obs_dim: int, h1: int, h2: int, n_actions: int):
+        super().__init__()
+        self.obs_dim = int(obs_dim)
+        self.n_actions = int(n_actions)
+        self.net = nn.Sequential(
+            nn.Linear(int(obs_dim), int(h1)),
+            nn.ReLU(),
+            nn.Linear(int(h1), int(h2)),
+            nn.ReLU(),
+            nn.Linear(int(h2), int(n_actions)),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.net(obs)
