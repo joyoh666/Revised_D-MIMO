@@ -36,16 +36,17 @@ class USRPReceiver(Thread):
 
         head, tail = 0, 0
         try:
-            while tail < num_samples:
-                tail += self.streamer.recv(recv_buffer, metadata)
-                tail = min(tail, num_samples)
-                samples[:, head:tail] = recv_buffer[:, :tail-head]
-                head = tail
+            while not self.stop_event.is_set():
+                while tail < num_samples:
+                    tail += self.streamer.recv(recv_buffer, metadata)
+                    tail = min(tail, num_samples)
+                    samples[:, head:tail] = recv_buffer[:, :tail-head]
+                    head = tail
 
-                if metadata.error_code != uhd.types.RXMetadataErrorCode.none:
-                    # print(metadata.error_code)
-                    if metadata.error_code != uhd.types.RXMetadataErrorCode.timeout:
-                        break
+                    if metadata.error_code != uhd.types.RXMetadataErrorCode.none:
+                        # print(metadata.error_code)
+                        if metadata.error_code != uhd.types.RXMetadataErrorCode.timeout:
+                            break
         except RuntimeError as ex:
             print(ex)
         
