@@ -1,21 +1,5 @@
 import numpy as np
 
-def ofdm_modulate(rg: np.ndarray,
-         fft_size: int,
-         N_cp: int) -> np.ndarray:
-
-    signal = np.fft.ifft(rg, n=fft_size, axis=0)
-    signal = np.concatenate([signal[-N_cp:, :], signal])
-
-    return signal
-
-def ofdm_demodulate(signal: np.ndarray,
-                    fft_size: int,
-                    N_cp: int) -> np.ndarray:
-    signal = signal[N_cp:, :]
-    symbol = np.fft.fft(signal, n=fft_size, axis=0)
-    return symbol
-
 def ofdm_modulate(params, resource_maps):
     num_subframe_per_frame = params["num_subframe_per_frame"]
     num_slot_per_subframe = params["num_slot_per_subframe"]
@@ -65,4 +49,4 @@ def ofdm_modulate(params, resource_maps):
         axis=-1
     )
 
-    return td_symbols_with_cp
+    return td_symbols_with_cp, td_symbols_with_cp_normal

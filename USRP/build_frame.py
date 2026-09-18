@@ -1,47 +1,8 @@
-import numpy as np
-from config import radio_config as rc
-from phy.qpsk import qpsk_modulate
-from phy.ofdm import ofdm_modulate, ofdm_demodulate
-from phy.resource_grid import resource_grid
-from phy.channel import generate_channel, apply_channel
-from phy.channel_estimation import LSestimation
 from USRP.helper_functions import get_zc_sequence, sss_sequence, get_virtual_pilot_positions
 from USRP.modulate import modulate
 
-def run_frame():
-    bits = np.random.randint(0, 2, 2 * len(rc.data_indices) * rc.N_ofdm_symbols)
-    expected_bits = 2 * len(rc.data_indices) * rc.N_ofdm_symbols
-    if bits.size != expected_bits:
-        raise ValueError(
-            f"Expected {expected_bits} bits for one frame, got {bits.size}"
-        )
-
-    symbols = qpsk_modulate(bits)
-
-    pilots = np.ones((len(rc.pilot_indices), rc.N_ofdm_symbols))
-    symbols = symbols.reshape(len(rc.data_indices), rc.N_ofdm_symbols)
-    
-    rg = resource_grid(symbols, pilots)
-
-    tx_data = ofdm_modulate(rg, rc.fft_size, rc.cp_length)
-
-    channel = generate_channel()
-    # Serialize OFDM symbols column by column before applying the time-domain
-    # channel. np.convolve (used by apply_channel) only accepts 1-D signals.
-    tx_shape = tx_data.shape
-    tx_data = tx_data.reshape(-1, order="F")
-    noise = (
-        np.random.randn(*tx_data.shape) + 1j * np.random.randn(*tx_data.shape)
-    ) * 0.01
-
-    rx_data = apply_channel(tx_data, channel) + noise
-    rx_data = rx_data.reshape(tx_shape, order="F")
-
-    demodulated_rg = ofdm_demodulate(rx_data, rc.fft_size, rc.cp_length)
-
-    channel_LS = LSestimation(demodulated_rg, pilots)
-
-    return channel_LS
+import numpy as np
+from .ofdm import ofdm_modulate
 
 def build_frame(params, known_ref_seq):
     N = params["N"]
@@ -53,6 +14,7 @@ def build_frame(params, known_ref_seq):
     num_slot_per_subframe = params["num_slot_per_subframe"]
     num_symbols_per_slot = params["num_symbols_per_slot"]
     N_PSS = params["N_PSS"]
+    POWER = params["POWER"]
 
     PDSCH_PLACEHOLDER = 999
 
@@ -114,4 +76,17 @@ def build_frame(params, known_ref_seq):
     pdsch_idx = np.where(resource_maps == PDSCH_PLACEHOLDER)
     resource_maps[pdsch_idx] = iq
 
-    
+    td_symbols_with_CP, td_symbols_with_cp_normal = ofdm_modulate(params, resource_maps)
+
+    ss_td_with_cp = td_symbols_with_cp_normal[0, 0, 4:, :].flatten()
+
+    td_symbols_with_CP *= np.sqrt(POWER)
+    waveform = np.reshape(td_symbols_with_CP, (-1,1)).astype(np.complex64)
+
+    return {
+            "resource_maps_tx": resource_maps,
+            "waveform": waveform,
+            "pdsch_idx": pdsch_idx,
+            "ss_td_with_cp": ss_td_with_cp,
+            "data_bits": data_bits,
+        }

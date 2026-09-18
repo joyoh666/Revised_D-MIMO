@@ -27,7 +27,7 @@ class GRUQNetwork(nn.Module):
             elif 'bias' in n:
                 nn.init.constant_(p, 0.0)
 
-    def _init_hidden(self, batch: int, device: torch.device) -> torch.Tensor:
+    def init_hidden(self, batch: int, device: torch.device) -> torch.Tensor:
         return self.h0.view(1, -1).expand(batch, -1).to(device)
 
     def forward(self, obs: torch.Tensor, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -10,9 +10,8 @@ from IPython.display import display
 import argparse
 import random
 
-from .Envconfig import EnvConfig
 from .DDQNscheduler import GRUQNetwork, MLPQNetwork
-from .Environment import WindowStore, RUWindowEnv
+from .test_environment import EnvConfig, WindowStore, RUWindowEnv
 
 
 STATE_NAMES = ["RU1", "RU2", "RU3", "RU12", "RU13", "RU23"]
@@ -360,3 +359,6 @@ def main(argv: Optional[List[str]] = None):
     plot_policy_comparison_inline(df_cmp, split_name="train")
 
     print("[DONE] Displayed sampled trajectories and comparison plots inline.")
+
+if __name__ == "__main__":
+    main()

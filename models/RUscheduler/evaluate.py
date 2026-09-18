@@ -1,11 +1,10 @@
 import torch
+import random
 from .DDQNscheduler import GRUQNetwork
-from .Environment import WindowStore, RUWindowEnv
-from .Envconfig import EnvConfig
+from .train_environment import EnvConfig, WindowStore, RUWindowEnv
 
 from typing import Dict, List
 import numpy as np
-from numpy import random
 
 @torch.no_grad()
 def evaluate_on_windows(

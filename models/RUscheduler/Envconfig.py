@@ -1,18 +1,4 @@
 from dataclasses import dataclass
-import math
-
-@dataclass
-class EnvConfig:
-    seg_len_ticks: int = 20
-    obs_bin_ticks: int = 20
-    obs_hist_bins: int = 3
-    mask_value: float = 0.0
-    handover_penalty: float = 100000000
-    inter_ru_phase_noise_std: float = math.pi / 8
-    two_ru_penalty: float = 0.0
-    noise_power: float = 1e-3
-    reward_snr_db: float = 10.0
-    max_episode_steps: int = 0
 
 @dataclass
 class DQNConfig:

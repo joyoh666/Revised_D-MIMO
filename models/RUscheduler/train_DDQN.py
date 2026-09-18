@@ -1,9 +1,10 @@
-from .Envconfig import EnvConfig, DQNConfig
-from .Environment import WindowStore, RUWindowEnv, VecEnv
+from .Envconfig import DQNConfig
+from .train_environment import EnvConfig, WindowStore, RUWindowEnv, VecEnv
 from .DDQNscheduler import GRUQNetwork, ReplayBuffer
 from .evaluate import evaluate_on_windows
 
 import argparse
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,7 +13,6 @@ import os
 from collections import deque
 from typing import List, Optional
 import time
-from numpy import random
 from pathlib import Path
 import math
 

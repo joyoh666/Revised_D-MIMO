@@ -1,10 +1,13 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
-import math
-from typing import List, Optional, Tuple, Dict
-from .Envconfig import EnvConfig 
+
 
 STATE_NAMES = ["RU1", "RU2", "RU3", "RU12", "RU13", "RU23"]
 N_ACTIONS = 6
@@ -24,10 +27,11 @@ STATE_RUS: Dict[int, List[int]] = {
     5: [2, 3],
 }
 
+
 class WindowStore:
     def __init__(self, window_dir: str):
         self.window_dir = Path(window_dir)
-        x_path = self.window_dir / "x.npz"
+        x_path = self.window_dir / "X.npz"
         m_path = self.window_dir / "manifest.csv"
         if not x_path.is_file():
             raise FileNotFoundError(f"Missing: {x_path}")
@@ -36,17 +40,15 @@ class WindowStore:
 
         self._npz = np.load(str(x_path), mmap_mode="r")
         if "X" not in self._npz:
-            raise ValueError(f"'X' not found in {x_path}")
+            raise KeyError(f"'X' not found in {x_path}")
         self.X = self._npz["X"]
+
         if self.X.ndim != 3 or self.X.shape[-1] != 6:
             raise ValueError(f"Expected X shape (N,L,6), got {self.X.shape}")
 
-        self.N = self.X.shape[0]
-        self.L = self.X.shape[1]
+        self.N = int(self.X.shape[0])
+        self.L = int(self.X.shape[1])
         self.dt = float(self._npz["dt"]) if "dt" in self._npz else 0.005
-        self.window_sec = float(self._npz["window_sec"]) if "window_sec" in self._npz else (self.L * self.dt)
-        self.gain_scales = self._npz["gain_scales"].astype(np.float32) if "gain_scales" in self._npz else np.ones((6,), np.float32)
-        self.gain_match_enable = int(self._npz["gain_match_enable"]) if "gain_match_enable" in self._npz else 0
 
         self.manifest = pd.read_csv(str(m_path))
         if "sample_id" not in self.manifest.columns:
@@ -55,7 +57,7 @@ class WindowStore:
         if len(self.manifest) != self.N:
             raise ValueError(f"manifest rows ({len(self.manifest)}) != X windows N ({self.N})")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.N
 
     def get_window_gains(self, idx: int) -> np.ndarray:
@@ -66,12 +68,23 @@ class WindowStore:
             g[bad] = 0.0
         return g
 
+
+@dataclass
+class EnvConfig:
+    seg_len_ticks: int = 20
+    obs_bin_ticks: int = 20
+    obs_hist_bins: int = 3
+    mask_value: float = 0.0
+    handover_penalty: float = 5e-4
+    inter_ru_phase_noise_std: float = math.pi / 8.0
+    noise_power: float = 1e-3
+    max_episode_steps: int = 0
+
+
 class RUWindowEnv:
-    def __init__(self, store: WindowStore, episode_indices: List[int], cfg: EnvConfig, training: bool):
+    def __init__(self, store: WindowStore, cfg: EnvConfig):
         self.store = store
-        self.episode_indices = episode_indices
         self.cfg = cfg
-        self.training = bool(training)
 
         self.obs_dim = 3 * self.cfg.obs_hist_bins + N_ACTIONS
         self.n_actions = N_ACTIONS
@@ -85,21 +98,48 @@ class RUWindowEnv:
         self._conn_state: int = 0
         self._conn_hist: List[int] = []
 
+    def reset(self, ep_idx: int) -> np.ndarray:
+        g = self.store.get_window_gains(int(ep_idx))
+        L = g.shape[0]
+        segL = int(self.cfg.seg_len_ticks)
+        if (L % segL) != 0:
+            raise ValueError(f"Window length L={L} not divisible by seg_len_ticks={segL}")
+
+        n_segs = L // segL
+        if n_segs < 2:
+            raise ValueError(f"Window too short: n_segs={n_segs} < 2")
+
+        self._g = g
+        self._ep_idx = int(ep_idx)
+        self._seg_k = 0
+        self._n_segs = int(n_segs)
+        self._steps = 0
+        self._conn_state = int(np.random.choice(list(range(N_ACTIONS))))
+        self._conn_hist = [int(self._conn_state)]
+
+        default_full = self._n_segs - 1
+        if int(self.cfg.max_episode_steps) <= 0:
+            self._max_steps_this_ep = default_full
+        else:
+            self._max_steps_this_ep = min(int(self.cfg.max_episode_steps), default_full)
+
+        return self._make_obs()
+
     def _seg_slice(self, seg_idx: int) -> slice:
         segL = int(self.cfg.seg_len_ticks)
         a = seg_idx * segL
         b = a + segL
         return slice(a, b)
 
-    def _ru_gain_from_segment(self, seg_idx: int) -> np.ndarray:
+    def ru_gain_segment(self, seg_idx: int) -> np.ndarray:
         assert self._g is not None
         seg = self._g[self._seg_slice(seg_idx), :]
-        ru1 = np.sqrt(np.maximum(seg[:, 0] ** 2 + seg[:, 1] ** 2, 0.0)).mean()
-        ru2 = np.sqrt(np.maximum(seg[:, 2] ** 2 + seg[:, 3] ** 2, 0.0)).mean()
-        ru3 = np.sqrt(np.maximum(seg[:, 4] ** 2 + seg[:, 5] ** 2, 0.0)).mean()
-        return np.array([ru1, ru2, ru3], dtype=np.float32)
+        g1 = np.sqrt(np.maximum(seg[:, 0] ** 2 + seg[:, 1] ** 2, 0.0)).mean()
+        g2 = np.sqrt(np.maximum(seg[:, 2] ** 2 + seg[:, 3] ** 2, 0.0)).mean()
+        g3 = np.sqrt(np.maximum(seg[:, 4] ** 2 + seg[:, 5] ** 2, 0.0)).mean()
+        return np.array([g1, g2, g3], dtype=np.float32)
 
-    def _all_state_power_from_segment(self, seg_idx: int) -> np.ndarray:
+    def all_state_power_segment(self, seg_idx: int) -> np.ndarray:
         assert self._g is not None
         seg = self._g[self._seg_slice(seg_idx), :].astype(np.float64)
 
@@ -125,61 +165,25 @@ class RUWindowEnv:
         p23 = pair_power(p2_t, p3_t)
 
         power = np.array([p1, p2, p3, p12, p13, p23], dtype=np.float32)
-        # Anchor: noise_power=1e-3 at 10 dB; scale by SNR only for rate reward calculation.
-        noise_power_reward = float(self.cfg.noise_power) * (10.0 ** ((10.0 - float(self.cfg.reward_snr_db)) / 10.0))
-        return np.log2(1.0 + power / noise_power_reward)
+        return np.log2(1.0 + power / float(self.cfg.noise_power))
 
     def _make_obs(self) -> np.ndarray:
         B = int(self.cfg.obs_hist_bins)
         obs = np.full((3, B), float(self.cfg.mask_value), dtype=np.float32)
-        
-        # Observation bins: [k-3, k-2, k-1]  => -400ms to -100ms
+
         for bi in range(B):
             seg_idx = int(self._seg_k) - (B - bi)
             seg_idx = max(0, min(seg_idx, self._n_segs - 1))
-            full = self._ru_gain_from_segment(seg_idx).astype(np.float32)
-        
+            full = self.ru_gain_segment(seg_idx).astype(np.float32)
+
             hist_idx = max(0, min(seg_idx, len(self._conn_hist) - 1))
             conn_state_seg = int(self._conn_hist[hist_idx])
             for ru in STATE_RUS[conn_state_seg]:
                 obs[ru - 1, bi] = full[ru - 1]
-        
+
         conn_oh = np.zeros((N_ACTIONS,), dtype=np.float32)
         conn_oh[int(self._conn_state)] = 1.0
         return np.concatenate([obs.reshape(-1).astype(np.float32), conn_oh], axis=0)
-        
-    def reset(self, ep_idx: Optional[int] = None) -> np.ndarray:
-        if ep_idx is None:
-            ep_idx = np.random.choice(self.episode_indices)
-        ep_idx = int(ep_idx)
-        if ep_idx not in self.episode_indices:
-            raise ValueError("reset ep_idx not in this env's episode_indices")
-
-        g = self.store.get_window_gains(ep_idx)
-        L = g.shape[0]
-        segL = int(self.cfg.seg_len_ticks)
-        if (L % segL) != 0:
-            raise ValueError(f"Window length L={L} not divisible by seg_len_ticks={segL}")
-
-        n_segs = L // segL
-        if n_segs < 2:
-            raise ValueError(f"Window too short: n_segs={n_segs} < 2")
-
-        self._g = g
-        self._ep_idx = ep_idx
-        self._seg_k = 0
-        self._n_segs = int(n_segs)
-        self._steps = 0
-        self._conn_state = int(np.random.choice(list(range(N_ACTIONS))))
-        self._conn_hist = [int(self._conn_state)]
-
-        default_full = self._n_segs - 1
-        if int(self.cfg.max_episode_steps) <= 0:
-            self._max_steps_this_ep = default_full
-        else:
-            self._max_steps_this_ep = min(int(self.cfg.max_episode_steps), default_full)
-
-        return self._make_obs()
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
         assert self._g is not None
@@ -189,9 +193,9 @@ class RUWindowEnv:
         conn_before = int(self._conn_state)
         rew_seg = obs_seg + 1
 
-        state_power = self._all_state_power_from_segment(rew_seg)
+        state_power = self.all_state_power_segment(rew_seg)
         handover_attempt = 1 if (int(action) != int(conn_before)) else 0
-        reward = float(state_power[action]) - float(self.cfg.handover_penalty) * float(handover_attempt) - float(self.cfg.two_ru_penalty) * float(action >= 3) - float(3.0)
+        reward = float(state_power[action]) - float(self.cfg.handover_penalty) * float(handover_attempt)
 
         self._conn_state = int(action)
         self._seg_k += 1
@@ -200,12 +204,11 @@ class RUWindowEnv:
         if len(self._conn_hist) <= int(self._seg_k):
             self._conn_hist.append(int(self._conn_state))
 
-        done = (self._steps >= self._max_steps_this_ep)
+        done = self._steps >= self._max_steps_this_ep
         obs = self._make_obs()
 
         info = {
             "window_index": int(self._ep_idx),
-            "dataset": str(self.store.manifest.loc[int(self._ep_idx), "dataset"]) if "dataset" in self.store.manifest.columns else "unknown",
             "seg_k": int(self._seg_k),
             "obs_seg": int(obs_seg),
             "reward_seg": int(rew_seg),
@@ -218,35 +221,4 @@ class RUWindowEnv:
             "conn_state_before": int(conn_before),
             "conn_state_after": int(self._conn_state),
         }
-        return obs, reward, done, info    
-
-class VecEnv:
-    def __init__(self, envs: List[RUWindowEnv]):
-        self.envs = envs
-        self.n = len(envs)
-        self.obs_dim = envs[0].obs_dim
-        self.n_actions = envs[0].n_actions
-
-    def reset(self) -> np.ndarray:
-        obs = [e.reset() for e in self.envs]
-        return np.stack(obs, axis=0)
-
-    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict]]:
-        obs_list, rew_list, done_list, info_list = [], [], [], []
-        for i, e in enumerate(self.envs):
-            o, r, d, info = e.step(int(actions[i]))
-            if d:
-                o = e.reset()
-                info["episode_reset"] = True
-            else:
-                info["episode_reset"] = False
-            obs_list.append(o)
-            rew_list.append(r)
-            done_list.append(d)
-            info_list.append(info)
-        return (
-            np.stack(obs_list, axis=0).astype(np.float32),
-            np.array(rew_list, dtype=np.float32),
-            np.array(done_list, dtype=np.bool_),
-            info_list,
-        )
+        return obs, reward, done, info
