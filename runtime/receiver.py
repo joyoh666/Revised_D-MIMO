@@ -1,10 +1,14 @@
 import uhd
 from threading import Thread
+from queue import Empty, Full, Queue
 import numpy as np
 
 class USRPReceiver(Thread):
-    def __init__(self, usrp, num_samples, carrier_frequency, sampling_rate, gain, channels, transmission_time, stop_event, otw_format):
+    def __init__(self, usrp, num_samples, carrier_frequency, sampling_rate, gain, channels, transmission_time, otw_format, stop_event, queue_size=8):
         super().__init__()
+        if queue_size <= 0:
+            raise ValueError("queue_size must be greater than zero")
+
         self.usrp = usrp
         self.num_samples = num_samples
         self.carrier_frequency = carrier_frequency
@@ -12,8 +16,10 @@ class USRPReceiver(Thread):
         self.gain = gain
         self.channels = channels
         self.transmission_time = transmission_time
-        self.stop_event = stop_event
         self.otw_format = otw_format
+        self.stop_event = stop_event
+        self.samples_queue = Queue(maxsize=queue_size)
+        self.dropped_blocks = 0
         
         for i, c in enumerate(channels):
           usrp.set_rx_rate(self.sampling_rate, c)
@@ -36,17 +42,19 @@ class USRPReceiver(Thread):
 
         head, tail = 0, 0
         try:
-            while not self.stop_event.is_set():
-                while tail < num_samples:
-                    tail += self.streamer.recv(recv_buffer, metadata)
-                    tail = min(tail, num_samples)
-                    samples[:, head:tail] = recv_buffer[:, :tail-head]
-                    head = tail
+            while tail < num_samples:
+                remaining = num_samples - tail
+                recv_view = recv_buffer[:, :min(remaining, self.num_samples_per_frame)]
 
-                    if metadata.error_code != uhd.types.RXMetadataErrorCode.none:
-                        # print(metadata.error_code)
-                        if metadata.error_code != uhd.types.RXMetadataErrorCode.timeout:
-                            break
+                num_recv = self.streamer.recv(recv_view, metadata)
+                tail += num_recv
+                samples[:, head:tail] = recv_buffer[:, :tail-head]
+                head = tail
+
+                if metadata.error_code != uhd.types.RXMetadataErrorCode.none:
+                    # print(metadata.error_code)
+                    if metadata.error_code != uhd.types.RXMetadataErrorCode.timeout:
+                        break
         except RuntimeError as ex:
             print(ex)
         
@@ -55,16 +63,28 @@ class USRPReceiver(Thread):
     
     def run(self):
         # Start Stream
-        stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.num_done) # num_done, stop_cont, start_cont
+        stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont) # num_done, stop_cont, start_cont
         stream_cmd.stream_now = False
         stream_cmd.time_spec = uhd.types.TimeSpec(self.transmission_time)
-        stream_cmd.num_samps = self.num_samples
         self.streamer.issue_stream_cmd(stream_cmd)
-        
+
         metadata = uhd.types.RXMetadata()
 
-        self.rcv_samples = self.receiveUSRP(self.num_samples, metadata)
-        
+        while not self.stop_event.is_set():
+            rcv_samples = self.receiveUSRP(self.num_samples, metadata)
+            try:
+                self.samples_queue.put_nowait(rcv_samples)
+            except Full:
+                # Keep the most recent samples without blocking the RX thread.
+                try:
+                    self.samples_queue.get_nowait()
+                except Empty:
+                    pass
+                else:
+                    self.samples_queue.task_done()
+                    self.dropped_blocks += 1
+                self.samples_queue.put_nowait(rcv_samples)
+
         # Close streamer
         stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
         self.streamer.issue_stream_cmd(stream_cmd)

@@ -15,14 +15,14 @@ def ofdm_modulate(params, resource_maps):
     )
 
     fft_symbols[..., 1:N // 2 + 1] = resource_maps[..., N // 2:]
-    fft_symbols[..., -(N // 2):] = resource_maps[..., N // 2]
+    fft_symbols[..., -(N // 2):] = resource_maps[..., :N // 2]
 
     td_symbols = np.fft.ifft(fft_symbols, axis=-1, norm="ortho").astype(np.complex64)
 
     td_symbols_with_cp_0th = np.concatenate(
         [
             td_symbols[:, :, 0:1, -first_CP_length:],
-            td_symbols[:, :, 1:, :],
+            td_symbols[:, :, 0:1, :],
         ],
         axis=-1
     )

@@ -24,13 +24,13 @@ def build_frame(params, known_ref_seq):
     ) * PDSCH_PLACEHOLDER
 
     zc_seq = get_zc_sequence(N_PSS, 25)
-    pss_start_idx = N - (N_PSS + 1) - (N - (N_PSS + 1) // 2)
+    pss_start_idx = N - (N_PSS + 1) - (N - (N_PSS + 1) // 2)        #Place zc_seq into middle of the active subcarriers
 
     pss = np.zeros(N, dtype=np.complex64)
     pss[pss_start_idx:pss_start_idx + N_PSS] = zc_seq
 
     sss_first = np.zeros(N, dtype=np.complex64)
-    sss_first[pss_start_idx:pss_start_idx + N_PSS] = sss_sequence(N_PSS, 0)
+    sss_first[pss_start_idx:pss_start_idx + N_PSS] = sss_sequence(N_PSS, 0)     #Place sss into middle of the active subcarriers
 
     sss_second = np.zeros(N, dtype=np.complex64)
     sss_second[pss_start_idx:pss_start_idx + N_PSS] = sss_sequence(N_PSS, 1)
@@ -41,6 +41,7 @@ def build_frame(params, known_ref_seq):
     resource_maps[0, 0, 5, :] = sss_first
     resource_maps[5, 0, 5, :] = sss_second
 
+    # Stack known reference sequence and place reference sequence into every first symbol in each slot
     known_ref_stacked = np.tile(
         known_ref_seq.reshape(1, 1, N),
         [num_subframe_per_frame, num_slot_per_subframe, 1]
@@ -58,11 +59,11 @@ def build_frame(params, known_ref_seq):
             extra_virtual_pilot_symbols += 1
 
     num_data_symbols = (
-        (num_symbols_per_slot - 1) 
+        (num_symbols_per_slot - 1)      # Exclude first symbol(reference symbol)
         * num_slot_per_subframe 
         * num_subframe_per_frame
-        - 4
-        - extra_virtual_pilot_symbols
+        - 4                             # Exclude two PSS, SSS_first, SSS_second
+        - extra_virtual_pilot_symbols   # Exclude virtual pilot 
     ) * N
 
     data_bits = np.random.randint(
@@ -78,6 +79,7 @@ def build_frame(params, known_ref_seq):
 
     td_symbols_with_CP, td_symbols_with_cp_normal = ofdm_modulate(params, resource_maps)
 
+    # SSS & PSS time domain symbol with CP : find frame start idx in receiver
     ss_td_with_cp = td_symbols_with_cp_normal[0, 0, 4:, :].flatten()
 
     td_symbols_with_CP *= np.sqrt(POWER)
