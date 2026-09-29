@@ -43,38 +43,65 @@ class TX0ReferenceAndRFOTests(unittest.TestCase):
             0,
         )
 
-    def test_virtual_pilots_use_six_nonzero_symbols_per_tx(self):
+    def test_fdm_pilots_share_symbols_and_use_distinct_subcarriers(self):
         resource_maps = self.frame["resource_maps_tx"]
         positions = self.params["virtual_pilot_positions"]
         num_tx_ant = self.params["num_tx_ant"]
         pilots_per_tx = self.params["num_virtual_pilots"]
+        num_csi_samples = self.params["num_csi_samples_per_frame"]
+        sample_period = self.params["csi_sample_period_subframes"]
 
-        self.assertEqual(len(positions), num_tx_ant * pilots_per_tx)
-        for tx_idx in range(num_tx_ant):
-            tx_positions = [
-                position for position in positions if position[0] == tx_idx
-            ]
-            self.assertEqual(len(tx_positions), pilots_per_tx)
-            self.assertEqual(
-                {position[3] for position in tx_positions},
-                set(range(1, self.params["num_symbols_per_slot"])),
-            )
-            for _, sf_idx, slot_idx, symbol_idx in tx_positions:
-                np.testing.assert_allclose(
-                    resource_maps[tx_idx, sf_idx, slot_idx, symbol_idx, :],
-                    self.known_ref_seq,
+        self.assertEqual(
+            len(positions),
+            num_csi_samples * num_tx_ant * pilots_per_tx,
+        )
+        for csi_sample_idx in range(num_csi_samples):
+            for tx_idx in range(num_tx_ant):
+                tx_positions = [
+                    position
+                    for position in positions
+                    if (
+                        position[0] == tx_idx
+                        and position[1] // sample_period == csi_sample_idx
+                    )
+                ]
+                self.assertEqual(len(tx_positions), pilots_per_tx)
+                self.assertEqual(
+                    {position[3] for position in tx_positions},
+                    {1, 2, 3},
                 )
-                other_tx_indices = np.arange(num_tx_ant) != tx_idx
-                np.testing.assert_array_equal(
-                    resource_maps[
-                        other_tx_indices,
-                        sf_idx,
-                        slot_idx,
-                        symbol_idx,
-                        :,
-                    ],
-                    0,
-                )
+                active_idx = self.params["fdm_pilot_active_indices"][tx_idx]
+                for _, sf_idx, slot_idx, symbol_idx in tx_positions:
+                    self.assertEqual(
+                        np.count_nonzero(
+                            resource_maps[
+                                tx_idx,
+                                sf_idx,
+                                slot_idx,
+                                symbol_idx,
+                            ]
+                        ),
+                        1,
+                    )
+                    np.testing.assert_allclose(
+                        resource_maps[
+                            tx_idx,
+                            sf_idx,
+                            slot_idx,
+                            symbol_idx,
+                            active_idx,
+                        ],
+                        self.known_ref_seq[active_idx],
+                    )
+
+    def test_frame_contains_one_five_ms_csi_interval(self):
+        self.assertEqual(self.params["num_subframe_per_frame"], 5)
+        self.assertEqual(self.params["num_csi_samples_per_frame"], 1)
+        self.assertEqual(self.params["csi_sample_period_s"], 5e-3)
+        self.assertAlmostEqual(
+            self.params["frame_length"] / self.params["sampling_rate"],
+            5e-3,
+        )
 
     def test_timing_synchronization_is_callable_independently(self):
         timing_offset = 29
@@ -160,21 +187,50 @@ class TX0ReferenceAndRFOTests(unittest.TestCase):
         num_tx_ant = params["num_tx_ant"]
         num_rx_ant = params["num_rx_ant"]
         num_pilots = params["num_virtual_pilots"]
+        num_csi_samples = params["num_csi_samples_per_frame"]
         num_subcarriers = params["N"]
 
         tx_indices = np.arange(num_tx_ant, dtype=np.float32)
-        channel_rx_tx = np.stack(
-            (
-                np.exp(1j * 0.2 * tx_indices),
-                0.7 * np.exp(1j * (-0.15 * tx_indices + 0.3)),
-            ),
+        channel_sample_rx_tx = np.stack(
+            [
+                np.stack(
+                    (
+                        np.exp(1j * (0.2 * tx_indices + 0.1 * sample_idx)),
+                        0.7
+                        * np.exp(
+                            1j
+                            * (
+                                -0.15 * tx_indices
+                                + 0.3
+                                + 0.12 * sample_idx
+                            )
+                        ),
+                    ),
+                    axis=0,
+                )
+                for sample_idx in range(num_csi_samples)
+            ],
             axis=0,
         ).astype(np.complex64)
-        resource_maps_rcv = np.sum(
-            channel_rx_tx[:, :, None, None, None, None]
-            * self.frame["resource_maps_tx"][None, ...],
-            axis=1,
+        resource_maps_rcv = np.empty(
+            (
+                num_rx_ant,
+                params["num_subframe_per_frame"],
+                params["num_slot_per_subframe"],
+                params["num_symbols_per_slot"],
+                num_subcarriers,
+            ),
+            dtype=np.complex64,
         )
+        for sf_idx in range(params["num_subframe_per_frame"]):
+            csi_sample_idx = (
+                sf_idx // params["csi_sample_period_subframes"]
+            )
+            resource_maps_rcv[:, sf_idx] = np.sum(
+                channel_sample_rx_tx[csi_sample_idx, :, :, None, None, None]
+                * self.frame["resource_maps_tx"][:, sf_idx][None, ...],
+                axis=1,
+            )
 
         outputs = channelestimation(
             params,
@@ -198,6 +254,13 @@ class TX0ReferenceAndRFOTests(unittest.TestCase):
             correction_phase,
             iq_rcv,
             iq_rcv_single,
+            csi_scalar_raw,
+            csi_scalar_aligned,
+            csi_repetitions_scalar,
+            csi_repetitions_scalar_aligned,
+            pilot_received_scalar,
+            pilot_snr_repetitions,
+            pilot_noise_power,
         ) = outputs
 
         self.assertEqual(
@@ -211,26 +274,57 @@ class TX0ReferenceAndRFOTests(unittest.TestCase):
             ),
         )
         self.assertEqual(h_single_fd.shape, h_fd.shape)
-        self.assertEqual(h_raw.shape, (num_tx_ant, num_rx_ant, num_subcarriers))
+        self.assertEqual(
+            h_raw.shape,
+            (num_csi_samples, num_tx_ant, num_rx_ant, num_subcarriers),
+        )
         self.assertEqual(h_aligned.shape, h_raw.shape)
         self.assertEqual(
             h_virtual.shape,
-            (num_tx_ant, num_pilots, num_rx_ant, num_subcarriers),
+            (
+                num_csi_samples,
+                num_tx_ant,
+                num_pilots,
+                num_rx_ant,
+                num_subcarriers,
+            ),
         )
         self.assertEqual(h_virtual_aligned.shape, h_virtual.shape)
         self.assertEqual(variance_raw.shape, h_raw.shape)
         self.assertEqual(variance_aligned.shape, h_raw.shape)
         self.assertEqual(
             common_phases.shape,
-            (num_tx_ant, num_pilots, num_rx_ant),
+            (num_csi_samples, num_tx_ant, num_pilots, num_rx_ant),
         )
         for metric in (single_snr, averaged_snr, snr_gain, correction_phase):
-            self.assertEqual(metric.shape, (num_tx_ant, num_rx_ant))
+            self.assertEqual(
+                metric.shape,
+                (num_csi_samples, num_tx_ant, num_rx_ant),
+            )
         self.assertEqual(iq_rcv.shape, (num_rx_ant, 0))
         self.assertEqual(iq_rcv_single.shape, (num_rx_ant, 0))
+        self.assertEqual(
+            csi_scalar_raw.shape,
+            (num_csi_samples, num_tx_ant, num_rx_ant),
+        )
+        self.assertEqual(csi_scalar_aligned.shape, csi_scalar_raw.shape)
+        for scalar_pilots in (
+            csi_repetitions_scalar,
+            csi_repetitions_scalar_aligned,
+            pilot_received_scalar,
+            pilot_snr_repetitions,
+        ):
+            self.assertEqual(
+                scalar_pilots.shape,
+                (num_csi_samples, num_tx_ant, num_pilots, num_rx_ant),
+            )
+        self.assertEqual(
+            pilot_noise_power.shape,
+            (num_csi_samples, num_pilots, num_rx_ant),
+        )
 
         expected_tx_rx = np.broadcast_to(
-            np.transpose(channel_rx_tx, (1, 0))[:, :, None],
+            np.transpose(channel_sample_rx_tx, (0, 2, 1))[:, :, :, None],
             h_raw.shape,
         )
         np.testing.assert_allclose(
@@ -239,9 +333,29 @@ class TX0ReferenceAndRFOTests(unittest.TestCase):
             rtol=1e-6,
             atol=1e-6,
         )
+        for sf_idx in range(params["num_subframe_per_frame"]):
+            csi_sample_idx = (
+                sf_idx // params["csi_sample_period_subframes"]
+            )
+            expected_grid_channel = np.broadcast_to(
+                channel_sample_rx_tx[csi_sample_idx, :, :, None, None],
+                h_fd[:, :, sf_idx].shape,
+            )
+            np.testing.assert_allclose(
+                h_fd[:, :, sf_idx],
+                expected_grid_channel,
+                rtol=1e-6,
+                atol=1e-6,
+            )
         np.testing.assert_allclose(
             h_aligned,
             expected_tx_rx,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            csi_scalar_raw,
+            np.transpose(channel_sample_rx_tx, (0, 2, 1)),
             rtol=1e-6,
             atol=1e-6,
         )
@@ -286,6 +400,7 @@ class TX0ReferenceAndRFOTests(unittest.TestCase):
         self.assertEqual(
             received["h_virtual_pilots_fd"].shape,
             (
+                self.params["num_csi_samples_per_frame"],
                 num_tx_ant,
                 self.params["num_virtual_pilots"],
                 1,

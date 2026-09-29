@@ -28,21 +28,14 @@ def build_frame(params, known_ref_seq):
     pss = np.zeros(N, dtype=np.complex64)
     pss[pss_start_idx:pss_start_idx + N_PSS] = zc_seq
 
-    sss_first = np.zeros(N, dtype=np.complex64)
-    sss_first[pss_start_idx:pss_start_idx + N_PSS] = sss_sequence(N_PSS, 0)     #Place sss into middle of the active subcarriers
+    sss = np.zeros(N, dtype=np.complex64)
+    sss[pss_start_idx:pss_start_idx + N_PSS] = sss_sequence(N_PSS, 0)
 
-    sss_second = np.zeros(N, dtype=np.complex64)
-    sss_second[pss_start_idx:pss_start_idx + N_PSS] = sss_sequence(N_PSS, 1)
-
-    for sfn in [0, 5]:
-        resource_maps[:, sfn, 0, 6, :] = 0
-        resource_maps[SYNC_TX_IDX, sfn, 0, 6, :] = pss
-
+    # Each 5 ms frame carries one synchronization pair at its beginning.
+    resource_maps[:, 0, 0, 6, :] = 0
+    resource_maps[SYNC_TX_IDX, 0, 0, 6, :] = pss
     resource_maps[:, 0, 0, 5, :] = 0
-    resource_maps[SYNC_TX_IDX, 0, 0, 5, :] = sss_first
-
-    resource_maps[:, 5, 0, 5, :] = 0
-    resource_maps[SYNC_TX_IDX, 5, 0, 5, :] = sss_second
+    resource_maps[SYNC_TX_IDX, 0, 0, 5, :] = sss
 
     # Stack known reference sequence and place reference sequence into every first symbol in each slot
     resource_maps[:, :, :, 0, :] = 0
@@ -52,7 +45,7 @@ def build_frame(params, known_ref_seq):
     )
     resource_maps[SYNC_TX_IDX, :, :, 0, :] = known_ref_stacked
 
-    resource_maps = place_virtual_pilots(resource_maps, known_ref_seq)
+    resource_maps = place_virtual_pilots(resource_maps, known_ref_seq, params)
 
     pdsch_idx = np.where(resource_maps == PDSCH_PLACEHOLDER)
     num_data_symbols = pdsch_idx[0].size

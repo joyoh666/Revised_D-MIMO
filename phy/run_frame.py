@@ -20,7 +20,7 @@ def run_frame():
 
     pilots = np.ones((len(rc.pilot_indices), rc.N_ofdm_symbols))
     symbols = symbols.reshape(len(rc.data_indices), rc.N_ofdm_symbols)
-    
+
     rg = resource_grid(symbols, pilots)
 
     tx_data = ofdm_modulate(rg, rc.fft_size, rc.cp_length)
@@ -67,17 +67,11 @@ def build_frame(params, known_ref_seq):
     pss = np.zeros(N, dtype=np.complex64)
     pss[pss_start_idx:pss_start_idx + N_PSS] = zc_seq
 
-    sss_first = np.zeros(N, dtype=np.complex64)
-    sss_first[pss_start_idx:pss_start_idx + N_PSS] = sss_sequence(N_PSS, 0)
+    sss = np.zeros(N, dtype=np.complex64)
+    sss[pss_start_idx:pss_start_idx + N_PSS] = sss_sequence(N_PSS, 0)
 
-    sss_second = np.zeros(N, dtype=np.complex64)
-    sss_second[pss_start_idx:pss_start_idx + N_PSS] = sss_sequence(N_PSS, 1)
-
-    for sfn in [0, 5]:
-        resource_maps[sfn, 0, 6, :] = pss
-
-    resource_maps[0, 0, 5, :] = sss_first
-    resource_maps[5, 0, 5, :] = sss_second
+    resource_maps[0, 0, 6, :] = pss
+    resource_maps[0, 0, 5, :] = sss
 
     known_ref_stacked = np.tile(
         known_ref_seq.reshape(1, 1, N),
@@ -85,23 +79,24 @@ def build_frame(params, known_ref_seq):
     )
     resource_maps[..., 0, :] = known_ref_stacked
 
-    extra_virtual_pilot_symbols = 0
-    for sf_idx, slot_idx, sym_idx in get_virtual_pilot_positions():
+    pilot_positions = get_virtual_pilot_positions()
+    for sf_idx, slot_idx, sym_idx in {
+        position[1:] for position in pilot_positions
+    }:
         if not (0 <= sf_idx < num_subframe_per_frame and 0 <= slot_idx < num_slot_per_subframe):
             continue
         if not (0 <= sym_idx < num_symbols_per_slot):
             continue
-        resource_maps[sf_idx, slot_idx, sym_idx, :] = known_ref_seq
-        if sym_idx != 0:
-            extra_virtual_pilot_symbols += 1
+        resource_maps[sf_idx, slot_idx, sym_idx, :] = 0
 
-    num_data_symbols = (
-        (num_symbols_per_slot - 1) 
-        * num_slot_per_subframe 
-        * num_subframe_per_frame
-        - 4
-        - extra_virtual_pilot_symbols
-    ) * N
+    for tx_idx, sf_idx, slot_idx, sym_idx in pilot_positions:
+        active_idx = params["fdm_pilot_active_indices"][tx_idx]
+        resource_maps[sf_idx, slot_idx, sym_idx, active_idx] = (
+            known_ref_seq[active_idx]
+        )
+
+    pdsch_idx = np.where(resource_maps == PDSCH_PLACEHOLDER)
+    num_data_symbols = pdsch_idx[0].size
 
     data_bits = np.random.randint(
         0,
@@ -111,7 +106,4 @@ def build_frame(params, known_ref_seq):
     )
     iq = modulate(data_bits, modulation_order)
 
-    pdsch_idx = np.where(resource_maps == PDSCH_PLACEHOLDER)
     resource_maps[pdsch_idx] = iq
-
-    

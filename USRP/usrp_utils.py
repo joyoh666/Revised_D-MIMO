@@ -1,8 +1,145 @@
 import numpy as np
 import uhd
+import time
 from threading import Thread
 
 # usrp_utils version 2025-05-20 18:50
+
+
+def configure_usrp_timing(
+    usrp,
+    *,
+    clock_source=None,
+    time_source=None,
+    sync_barrier=None,
+    sync_timeout=10.0,
+):
+    """Configure reference inputs and align device time on a common PPS."""
+    if (clock_source is None) != (time_source is None):
+        raise ValueError(
+            "clock_source and time_source must be provided together"
+        )
+
+    if clock_source is None:
+        usrp.set_time_unknown_pps(uhd.types.TimeSpec(0.0))
+        return
+
+    for mboard in range(usrp.get_num_mboards()):
+        usrp.set_clock_source(clock_source, mboard)
+        usrp.set_time_source(time_source, mboard)
+
+        actual_clock_source = usrp.get_clock_source(mboard)
+        actual_time_source = usrp.get_time_source(mboard)
+        if actual_clock_source != clock_source:
+            raise RuntimeError(
+                f"motherboard {mboard} clock source is "
+                f"{actual_clock_source!r}, expected {clock_source!r}"
+            )
+        if actual_time_source != time_source:
+            raise RuntimeError(
+                f"motherboard {mboard} time source is "
+                f"{actual_time_source!r}, expected {time_source!r}"
+            )
+
+    if sync_barrier is not None:
+        sync_barrier.wait(timeout=sync_timeout)
+
+        # Observe one shared PPS first. The second barrier leaves almost a
+        # full second for every process to arm the following PPS edge.
+        previous_pps = usrp.get_time_last_pps().get_real_secs()
+        deadline = time.monotonic() + sync_timeout
+        while usrp.get_time_last_pps().get_real_secs() == previous_pps:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("no external PPS edge was detected")
+            time.sleep(0.01)
+        sync_barrier.wait(timeout=sync_timeout)
+
+    # Every process arms this call after observing the same OctoClock edge,
+    # so every RU and the UE latch zero on the following PPS edge.
+    usrp.set_time_next_pps(uhd.types.TimeSpec(0.0))
+    time.sleep(1.1)
+
+
+def initialize_tx_usrp(
+    device_args,
+    tx_subdev_spec,
+    tx_antenna,
+    tx_channels,
+    *,
+    clock_source=None,
+    time_source=None,
+    sync_barrier=None,
+):
+    """Create a TX-only MultiUSRP for the distributed RU process."""
+    usrp = uhd.usrp.MultiUSRP(device_args)
+    configure_usrp_timing(
+        usrp,
+        clock_source=clock_source,
+        time_source=time_source,
+        sync_barrier=sync_barrier,
+    )
+
+    for mboard in range(usrp.get_num_mboards()):
+        usrp.set_tx_subdev_spec(
+            uhd.usrp.SubdevSpec(tx_subdev_spec),
+            mboard,
+        )
+
+    tx_channels = tuple(tx_channels)
+    if not tx_channels:
+        raise ValueError("at least one TX channel must be selected")
+    if min(tx_channels) < 0:
+        raise ValueError("TX channel indices must be non-negative")
+    if max(tx_channels) >= usrp.get_tx_num_channels():
+        raise ValueError("configured TX channel is not exposed by the USRP")
+
+    for channel in tx_channels:
+        usrp.set_tx_antenna(tx_antenna, channel)
+
+    print("RU USRPs loaded. TX session ready.")
+    print(f"TX channels: {tx_channels}")
+    return usrp
+
+
+def initialize_rx_usrp(
+    device_args,
+    rx_subdev_spec,
+    rx_antenna,
+    rx_channels,
+    *,
+    clock_source=None,
+    time_source=None,
+    sync_barrier=None,
+):
+    """Create an RX-only MultiUSRP for the UE process."""
+    usrp = uhd.usrp.MultiUSRP(device_args)
+    configure_usrp_timing(
+        usrp,
+        clock_source=clock_source,
+        time_source=time_source,
+        sync_barrier=sync_barrier,
+    )
+
+    for mboard in range(usrp.get_num_mboards()):
+        usrp.set_rx_subdev_spec(
+            uhd.usrp.SubdevSpec(rx_subdev_spec),
+            mboard,
+        )
+
+    rx_channels = tuple(rx_channels)
+    if not rx_channels:
+        raise ValueError("at least one RX channel must be selected")
+    if min(rx_channels) < 0:
+        raise ValueError("RX channel indices must be non-negative")
+    if max(rx_channels) >= usrp.get_rx_num_channels():
+        raise ValueError("configured RX channel is not exposed by the USRP")
+
+    for channel in rx_channels:
+        usrp.set_rx_antenna(rx_antenna, channel)
+
+    print("UE USRP loaded. RX session ready.")
+    print(f"RX channels: {rx_channels}")
+    return usrp
 
 
 def initialize_usrp(

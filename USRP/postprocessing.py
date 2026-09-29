@@ -112,6 +112,14 @@ def synchronize_frame_timing(frame_rcv_ifosync, ss_td_with_cp, params):
     normal_CP_length = int(params["normal_CP_length"])
     frame_length = int(params["frame_length"])
 
+    # The timing template begins at symbol 5 and contains SSS and PSS. Convert
+    # that template position back to the beginning of the frame.
+    ss_start_idx = (
+        FFT_SIZE * 5
+        + first_CP_length
+        + normal_CP_length * 4
+    )
+
     correlations = np.stack(
         [
             correlate(
@@ -127,18 +135,29 @@ def synchronize_frame_timing(frame_rcv_ifosync, ss_td_with_cp, params):
         np.abs(correlations) ** 2,
         axis=0,
     )
-    max_corr_idx = int(np.argmax(combined_correlation_power))
+    # Only search timing candidates for which a complete frame can be
+    # extracted.  A streaming capture can contain the synchronization symbols
+    # of the following frame in its trailing samples; allowing that peak to
+    # win would select a frame for which the remaining samples are unavailable.
+    max_frame_start = frame_rcv_ifosync.shape[1] - frame_length
+    first_candidate = ss_start_idx
+    last_candidate = min(
+        combined_correlation_power.size,
+        ss_start_idx + max_frame_start + 1,
+    )
+    if max_frame_start >= 0 and first_candidate < last_candidate:
+        candidate_powers = combined_correlation_power[
+            first_candidate:last_candidate
+        ]
+        max_corr_idx = int(first_candidate + np.argmax(candidate_powers))
+    else:
+        # Preserve the existing short-capture behavior: select the strongest
+        # peak and let the extraction below fall back to zero-padding.
+        max_corr_idx = int(np.argmax(combined_correlation_power))
     timing_correlation_peaks = np.abs(
         correlations[:, max_corr_idx]
     ).astype(np.float32)
 
-    # The timing template begins at symbol 5 and contains SSS and PSS. Convert
-    # that template position back to the beginning of the frame.
-    ss_start_idx = (
-        FFT_SIZE * 5
-        + first_CP_length
-        + normal_CP_length * 4
-    )
     sync_idx = int(max_corr_idx - ss_start_idx)
     if (
         sync_idx < 0
@@ -405,7 +424,14 @@ def postprocess(params,
         snr_gain_db,
         correction_phase,
         iq_rcv,
-        iq_rcv_single
+        iq_rcv_single,
+        csi_scalar_raw,
+        csi_scalar_aligned,
+        csi_repetitions_scalar,
+        csi_repetitions_scalar_aligned,
+        pilot_received_scalar,
+        pilot_snr_repetitions_db,
+        pilot_noise_power,
     ) = channelestimation(params, resource_maps_rcv, known_ref_seq, pdsch_idx)
 
     return {
@@ -419,6 +445,15 @@ def postprocess(params,
             "h_fd_virtual_avg_aligned": h_fd_virtual_avg.astype(np.complex64),
             "h_virtual_pilots_fd": h_virtual_pilots,
             "h_virtual_pilots_fd_aligned": h_virtual_pilots_aligned,
+            "csi_scalar_raw": csi_scalar_raw,
+            "csi_scalar_aligned": csi_scalar_aligned,
+            "csi_repetitions_scalar": csi_repetitions_scalar,
+            "csi_repetitions_scalar_aligned": (
+                csi_repetitions_scalar_aligned
+            ),
+            "pilot_received_scalar": pilot_received_scalar,
+            "pilot_snr_repetitions_db": pilot_snr_repetitions_db,
+            "pilot_noise_power": pilot_noise_power,
             "virtual_pilot_variance_raw": virtual_pilot_variance_raw,
             "virtual_pilot_variance_aligned": virtual_pilot_variance_aligned,
             "virtual_pilot_common_phases_rad": virtual_pilot_common_phases,

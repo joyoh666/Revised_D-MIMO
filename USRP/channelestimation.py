@@ -1,14 +1,11 @@
 import numpy as np
 
 from config.radio_config import PHASE_ALIGN_VIRTUAL_PILOTS
-from .helper_functions import (
-    phase_align_channel_estimates,
-    pilot_snr_db_from_equalized,
-)
+from .helper_functions import phase_align_channel_estimates
 
 
 def channelestimation(params, resource_maps_rcv, known_ref_seq, pdsch_idx):
-    """Estimate every TX-to-RX channel from TDM virtual pilots.
+    """Estimate every TX-to-RX channel from simultaneous FDM pilots.
 
     ``resource_maps_rcv`` has shape
     ``(num_rx_ant, num_subframes, num_slots, num_symbols, N)``.
@@ -22,6 +19,8 @@ def channelestimation(params, resource_maps_rcv, known_ref_seq, pdsch_idx):
     num_tx_ant = params["num_tx_ant"]
     num_rx_ant = params["num_rx_ant"]
     num_virtual_pilots = params["num_virtual_pilots"]
+    num_csi_samples = params["num_csi_samples_per_frame"]
+    csi_sample_period_subframes = params["csi_sample_period_subframes"]
 
     if resource_maps_rcv.ndim != 5:
         raise ValueError(
@@ -48,70 +47,105 @@ def channelestimation(params, resource_maps_rcv, known_ref_seq, pdsch_idx):
             f"known_ref_seq has shape {known_ref_seq.shape}, expected {(N,)}"
         )
 
-    h_virtual_pilots_by_tx = [[] for _ in range(num_tx_ant)]
-    virtual_pilot_symbols_by_tx = [[] for _ in range(num_tx_ant)]
+    pilot_counts = np.zeros(
+        (num_csi_samples, num_tx_ant),
+        dtype=np.int64,
+    )
+    h_scalar = np.empty(
+        (num_csi_samples, num_tx_ant, num_virtual_pilots, num_rx_ant),
+        dtype=np.complex64,
+    )
+    pilot_received_scalar = np.empty_like(h_scalar)
+    pilot_noise_power = np.full(
+        (num_csi_samples, num_virtual_pilots, num_rx_ant),
+        np.nan,
+        dtype=np.float32,
+    )
 
+    active_indices = np.asarray(
+        params["fdm_pilot_active_indices"],
+        dtype=np.int64,
+    )
+    if active_indices.shape != (num_tx_ant,):
+        raise ValueError("FDM requires one active pilot index per TX")
+    noise_indices = np.setdiff1d(
+        np.arange(N, dtype=np.int64),
+        active_indices,
+        assume_unique=True,
+    )
+    measured_noise_positions = set()
     for position in params["virtual_pilot_positions"]:
         tx_idx, sf_idx, slot_idx, sym_idx = position
-        if not (
-            0 <= tx_idx < num_tx_ant
-            and 0 <= sf_idx < num_subframe_per_frame
-            and 0 <= slot_idx < num_slot_per_subframe
-            and 0 <= sym_idx < num_symbols_per_slot
-        ):
-            raise ValueError(f"Invalid virtual-pilot position: {position}")
-
-        pilot_received = resource_maps_rcv[:, sf_idx, slot_idx, sym_idx, :]
-        h_virtual_pilots_by_tx[tx_idx].append(
-            pilot_received / known_ref_seq[None, :]
+        csi_sample_idx = sf_idx // csi_sample_period_subframes
+        repetition = int(pilot_counts[csi_sample_idx, tx_idx])
+        active_idx = int(active_indices[tx_idx])
+        received_symbol = resource_maps_rcv[
+            :, sf_idx, slot_idx, sym_idx, :
+        ]
+        received_pilot = received_symbol[:, active_idx]
+        pilot_received_scalar[
+            csi_sample_idx, tx_idx, repetition
+        ] = received_pilot
+        h_scalar[csi_sample_idx, tx_idx, repetition] = (
+            received_pilot / known_ref_seq[active_idx]
         )
-        virtual_pilot_symbols_by_tx[tx_idx].append(pilot_received)
+        pilot_counts[csi_sample_idx, tx_idx] += 1
 
-    pilot_counts = [len(pilots) for pilots in h_virtual_pilots_by_tx]
-    expected_counts = [num_virtual_pilots] * num_tx_ant
-    if pilot_counts != expected_counts:
+        noise_key = (csi_sample_idx, repetition)
+        if noise_key not in measured_noise_positions:
+            pilot_noise_power[csi_sample_idx, repetition] = np.mean(
+                np.abs(received_symbol[:, noise_indices]) ** 2,
+                axis=-1,
+            ).astype(np.float32)
+            measured_noise_positions.add(noise_key)
+
+    expected_counts = np.full_like(pilot_counts, num_virtual_pilots)
+    if not np.array_equal(pilot_counts, expected_counts):
         raise ValueError(
-            "Each TX antenna must have exactly "
-            f"{num_virtual_pilots} virtual pilots; got {pilot_counts}"
+            "Each TX antenna in each CSI interval must have exactly "
+            f"{num_virtual_pilots} virtual pilots; got {pilot_counts.tolist()}"
         )
 
-    # (num_tx_ant, num_virtual_pilots, num_rx_ant, N)
-    h_virtual_pilots = np.stack(
-        [np.stack(pilots, axis=0) for pilots in h_virtual_pilots_by_tx],
-        axis=0,
-    ).astype(np.complex64)
-    virtual_pilot_received = np.stack(
-        [
-            np.stack(pilots, axis=0)
-            for pilots in virtual_pilot_symbols_by_tx
-        ],
-        axis=0,
+    aligned_scalar = np.empty_like(h_scalar)
+    virtual_pilot_common_phases = np.empty(
+        h_scalar.shape,
+        dtype=np.float32,
+    )
+    for csi_sample_idx in range(num_csi_samples):
+        for tx_idx in range(num_tx_ant):
+            aligned, common_phases = phase_align_channel_estimates(
+                h_scalar[csi_sample_idx, tx_idx, :, :, None]
+            )
+            aligned_scalar[csi_sample_idx, tx_idx] = aligned[..., 0]
+            virtual_pilot_common_phases[csi_sample_idx, tx_idx] = (
+                common_phases
+            )
+
+    h_scalar_avg_raw = np.mean(h_scalar, axis=2).astype(np.complex64)
+    h_scalar_avg_aligned = np.mean(
+        aligned_scalar,
+        axis=2,
     ).astype(np.complex64)
 
-    # Average only the repeated-pilot axis.
-    # Shape: (num_tx_ant, num_rx_ant, N)
-    h_fd_virtual_avg_raw = np.mean(h_virtual_pilots, axis=1).astype(np.complex64)
-    aligned_per_tx = []
-    phases_per_tx = []
-    for tx_idx in range(num_tx_ant):
-        aligned, common_phases = phase_align_channel_estimates(
-            h_virtual_pilots[tx_idx]
-        )
-        aligned_per_tx.append(aligned)
-        phases_per_tx.append(common_phases)
-    h_virtual_pilots_aligned = np.stack(
-        aligned_per_tx,
-        axis=0,
-    ).astype(np.complex64)
-    # Shape: (num_tx_ant, num_virtual_pilots, num_rx_ant)
-    virtual_pilot_common_phases = np.stack(
-        phases_per_tx,
-        axis=0,
-    ).astype(np.float32)
+    # Under the paper's frequency-flat assumption, expose the scalar FDM
+    # estimate on every active subcarrier so legacy full-band consumers keep
+    # their established shapes. The scalar arrays remain authoritative.
+    h_virtual_pilots = np.broadcast_to(
+        h_scalar[..., None],
+        h_scalar.shape + (N,),
+    ).copy()
+    h_virtual_pilots_aligned = np.broadcast_to(
+        aligned_scalar[..., None],
+        aligned_scalar.shape + (N,),
+    ).copy()
 
+    h_fd_virtual_avg_raw = np.mean(
+        h_virtual_pilots,
+        axis=2,
+    ).astype(np.complex64)
     h_fd_virtual_avg_aligned = np.mean(
         h_virtual_pilots_aligned,
-        axis=1,
+        axis=2,
     ).astype(np.complex64)
     phase_align_virtual_pilots = params.get(
         "phase_align_virtual_pilots",
@@ -122,26 +156,26 @@ def channelestimation(params, resource_maps_rcv, known_ref_seq, pdsch_idx):
     else:
         h_fd_for_equalization = h_fd_virtual_avg_raw
 
-    # Per-TX, per-RX, per-subcarrier estimator variance across pilots.
+    # Per-TX, per-RX, per-subcarrier estimator variance across pilots. In FDM
+    # mode this is the scalar estimator variance repeated over the active band.
     virtual_pilot_variance_raw = np.mean(
         np.abs(
             h_virtual_pilots
-            - h_fd_virtual_avg_raw[:, None, :, :]
+            - h_fd_virtual_avg_raw[:, :, None, :, :]
         ) ** 2,
-        axis=1,
+        axis=2,
     ).astype(np.float32)
     virtual_pilot_variance_aligned = np.mean(
         np.abs(
             h_virtual_pilots_aligned
-            - h_fd_virtual_avg_aligned[:, None, :, :]
+            - h_fd_virtual_avg_aligned[:, :, None, :, :]
         ) ** 2,
-        axis=1,
+        axis=2,
     ).astype(np.float32)
 
-    # Expose the full channel using conventional (RX, TX, ...) ordering.
-    h_fd_rx_tx = np.transpose(h_fd_for_equalization, (1, 0, 2))
-    h_fd = np.broadcast_to(
-        h_fd_rx_tx[:, :, None, None, :],
+    # Map each 5 ms CSI sample to the subframes in its own interval while
+    # retaining the existing (RX, TX, subframe, slot, subcarrier) interface.
+    h_fd = np.empty(
         (
             num_rx_ant,
             num_tx_ant,
@@ -149,13 +183,19 @@ def channelestimation(params, resource_maps_rcv, known_ref_seq, pdsch_idx):
             num_slot_per_subframe,
             N,
         ),
-    ).copy()
+        dtype=np.complex64,
+    )
+    for sf_idx in range(num_subframe_per_frame):
+        csi_sample_idx = sf_idx // csi_sample_period_subframes
+        h_fd_rx_tx = np.transpose(
+            h_fd_for_equalization[csi_sample_idx],
+            (1, 0, 2),
+        )
+        h_fd[:, :, sf_idx, :, :] = h_fd_rx_tx[:, :, None, :]
 
     # Baseline estimate from the first virtual pilot of every TX.
-    h_single_fd = h_virtual_pilots[:, 0, :, :]
-    h_single_fd_rx_tx = np.transpose(h_single_fd, (1, 0, 2))
-    h_single_fd_full = np.broadcast_to(
-        h_single_fd_rx_tx[:, :, None, None, :],
+    h_single_fd = h_virtual_pilots[:, :, 0, :, :]
+    h_single_fd_full = np.empty(
         (
             num_rx_ant,
             num_tx_ant,
@@ -163,7 +203,17 @@ def channelestimation(params, resource_maps_rcv, known_ref_seq, pdsch_idx):
             num_slot_per_subframe,
             N,
         ),
-    ).copy()
+        dtype=np.complex64,
+    )
+    for sf_idx in range(num_subframe_per_frame):
+        csi_sample_idx = sf_idx // csi_sample_period_subframes
+        h_single_fd_rx_tx = np.transpose(
+            h_single_fd[csi_sample_idx],
+            (1, 0, 2),
+        )
+        h_single_fd_full[:, :, sf_idx, :, :] = (
+            h_single_fd_rx_tx[:, :, None, :]
+        )
 
     # The received grid has no separable TX data axis. Keep this path focused
     # on channel sounding instead of indexing it with TX-domain pdsch_idx.
@@ -171,34 +221,30 @@ def channelestimation(params, resource_maps_rcv, known_ref_seq, pdsch_idx):
     iq_rcv = np.empty((num_rx_ant, 0), dtype=np.complex64)
     iq_rcv_single = np.empty((num_rx_ant, 0), dtype=np.complex64)
     correction_phase = np.zeros(
-        (num_tx_ant, num_rx_ant),
+        (num_csi_samples, num_tx_ant, num_rx_ant),
         dtype=np.float32,
     )
 
-    # Pilot-domain quality metrics are evaluated independently per TX.
-    single_pilot_snr_db = []
-    virtual_pilot_snr_db = []
-    for tx_idx in range(num_tx_ant):
-        h_gain_raw = virtual_pilot_received[tx_idx] / (
-            h_fd_for_equalization[tx_idx][None, ...] + 1e-12
+    signal_power = np.abs(pilot_received_scalar) ** 2
+    pilot_snr_repetitions_db = (
+        10.0
+        * np.log10(
+            (signal_power + 1e-20)
+            / (pilot_noise_power[:, None, :, :] + 1e-20)
         )
-        h_gain_single = virtual_pilot_received[tx_idx] / (
-            h_single_fd[tx_idx][None, ...] + 1e-12
+    ).astype(np.float32)
+    single_pilot_snr_db = pilot_snr_repetitions_db[:, :, 0, :]
+    virtual_pilot_snr_db = (
+        10.0
+        * np.log10(
+            (np.mean(signal_power, axis=2) + 1e-20)
+            / (
+                np.mean(pilot_noise_power, axis=1)[:, None, :]
+                / num_virtual_pilots
+                + 1e-20
+            )
         )
-        single_pilot_snr_db.append(
-            pilot_snr_db_from_equalized(h_gain_single, known_ref_seq)
-        )
-        virtual_pilot_snr_db.append(
-            pilot_snr_db_from_equalized(h_gain_raw, known_ref_seq)
-        )
-    single_pilot_snr_db = np.asarray(
-        single_pilot_snr_db,
-        dtype=np.float32,
-    )
-    virtual_pilot_snr_db = np.asarray(
-        virtual_pilot_snr_db,
-        dtype=np.float32,
-    )
+    ).astype(np.float32)
     snr_gain_db = virtual_pilot_snr_db - single_pilot_snr_db
 
     return (
@@ -217,4 +263,11 @@ def channelestimation(params, resource_maps_rcv, known_ref_seq, pdsch_idx):
         correction_phase,
         iq_rcv,
         iq_rcv_single,
+        h_scalar_avg_raw,
+        h_scalar_avg_aligned,
+        h_scalar,
+        aligned_scalar,
+        pilot_received_scalar,
+        pilot_snr_repetitions_db,
+        pilot_noise_power,
     )

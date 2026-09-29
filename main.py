@@ -137,8 +137,11 @@ def _print_saved_summary(
         "frame_length_samples",
         "num_channel_captures",
         "num_receive_antennas",
+        "num_transmit_antennas",
+        "num_csi_samples_per_frame",
+        "csi_sample_period_ms",
         "saved_channel_tensor_shape",
-        "saved_mean_channel_shape",
+        "saved_csi_channel_shape",
         "saved_delay_response_shape",
     ):
         print(f"  {key}: {metadata[key]}")

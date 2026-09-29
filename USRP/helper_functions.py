@@ -1,16 +1,29 @@
 import numpy as np
-from config.radio_config import (VIRTUAL_PILOT_SUBFRAME, 
-                                VIRTUAL_PILOT_SLOT, VIRTUAL_PILOT_SYMBOLS,
-                                bandwidth_options, DELTA_F,
-                                normal_CP_time, first_CP_time, 
-                                num_symbols_per_slot, num_slot_per_subframe, num_subframe_per_frame,
-                                num_symbols_frame,carrier_frequency, Tx_gain, Rx_gain,
-                                modulation_order, POWER,
-                                N_PSS, NUM_VIRTUAL_PILOTS,
-                                PHASE_ALIGN_VIRTUAL_PILOTS,
-                                SYNC_TX_IDX, num_tx_ant, num_rx_ant,
-                                VIRTUAL_PILOT_GLOBAL_SLOTS
-                                )
+from config.radio_config import (
+    CSI_SAMPLE_PERIOD_SUBFRAMES,
+    DELTA_F,
+    FDM_PILOT_CENTERED_BINS,
+    FDM_PILOT_GLOBAL_SLOT,
+    N_PSS,
+    NUM_VIRTUAL_PILOTS,
+    PHASE_ALIGN_VIRTUAL_PILOTS,
+    POWER,
+    SYNC_TX_IDX,
+    VIRTUAL_PILOT_SYMBOL_START,
+    bandwidth_options,
+    carrier_frequency,
+    first_CP_time,
+    modulation_order,
+    normal_CP_time,
+    num_rx_ant,
+    num_slot_per_subframe,
+    num_subframe_per_frame,
+    num_symbols_frame,
+    num_symbols_per_slot,
+    num_tx_ant,
+    Rx_gain,
+    Tx_gain,
+)
 
 def get_zc_sequence(N, q=25):
     m = np.arange(N)
@@ -35,50 +48,75 @@ def generate_known_reference_sequence(num_subcarriers, seed=2026):
     seq = seq / np.sqrt(np.mean(np.abs(seq) ** 2))
     return seq.astype(np.complex64)
 
-def get_virtual_pilot_positions():
-    num_slots = num_subframe_per_frame * num_slot_per_subframe
-    virtual_pilot_symbols = tuple(VIRTUAL_PILOT_SYMBOLS)
+def centered_bin_to_active_index(centered_bin, num_subcarriers):
+    """Map a non-DC centered FFT bin to the active-subcarrier axis."""
+    half = int(num_subcarriers) // 2
+    centered_bin = int(centered_bin)
+    if centered_bin == 0 or abs(centered_bin) > half:
+        raise ValueError(
+            f"centered bin {centered_bin} is outside the active allocation"
+        )
+    if centered_bin < 0:
+        return centered_bin + half
+    return half + centered_bin - 1
 
-    if len(VIRTUAL_PILOT_GLOBAL_SLOTS) != num_tx_ant:
+
+def get_fdm_pilot_active_indices(num_subcarriers):
+    """Return the active-axis pilot index assigned to every TX antenna."""
+    if len(FDM_PILOT_CENTERED_BINS) != num_tx_ant:
         raise ValueError(
-            "VIRTUAL_PILOT_GLOBAL_SLOTS must contain exactly one slot "
-            f"for each TX antenna; got {len(VIRTUAL_PILOT_GLOBAL_SLOTS)} "
-            f"slots for {num_tx_ant} antennas"
+            "FDM_PILOT_CENTERED_BINS must contain one bin per TX antenna"
         )
-    if len(set(VIRTUAL_PILOT_GLOBAL_SLOTS)) != num_tx_ant:
-        raise ValueError("Each TX antenna must use a different virtual-pilot slot")
-    if len(virtual_pilot_symbols) != NUM_VIRTUAL_PILOTS:
+    if len(set(FDM_PILOT_CENTERED_BINS)) != num_tx_ant:
+        raise ValueError("FDM pilot bins must be mutually distinct")
+    return tuple(
+        centered_bin_to_active_index(centered_bin, num_subcarriers)
+        for centered_bin in FDM_PILOT_CENTERED_BINS
+    )
+
+
+def get_virtual_pilot_positions():
+    """Return every FDM pilot as ``(tx, subframe, slot, symbol)``."""
+    first_symbol = VIRTUAL_PILOT_SYMBOL_START
+    last_symbol_exclusive = first_symbol + NUM_VIRTUAL_PILOTS
+    if first_symbol <= 0 or last_symbol_exclusive > num_symbols_per_slot:
         raise ValueError(
-            "NUM_VIRTUAL_PILOTS does not match VIRTUAL_PILOT_SYMBOLS"
+            "The FDM virtual-pilot block must fit in symbols "
+            "1..num_symbols_per_slot-1; symbol 0 is reserved for the "
+            "TX0 RFO reference"
         )
-    if any(
-        symbol_idx <= 0 or symbol_idx >= num_symbols_per_slot
-        for symbol_idx in virtual_pilot_symbols
-    ):
+    if num_subframe_per_frame % CSI_SAMPLE_PERIOD_SUBFRAMES:
         raise ValueError(
-            "Virtual pilots must use symbols 1..num_symbols_per_slot-1; "
-            "symbol 0 is reserved for the TX0 RFO reference"
+            "num_subframe_per_frame must be divisible by "
+            "CSI_SAMPLE_PERIOD_SUBFRAMES"
+        )
+
+    slots_per_csi_sample = (
+        CSI_SAMPLE_PERIOD_SUBFRAMES * num_slot_per_subframe
+    )
+    if not 0 <= FDM_PILOT_GLOBAL_SLOT < slots_per_csi_sample:
+        raise ValueError(
+            "FDM_PILOT_GLOBAL_SLOT must lie in the first CSI interval"
         )
 
     positions = []
-
-    for tx_idx, global_slot_idx in enumerate(VIRTUAL_PILOT_GLOBAL_SLOTS):
-        if not 0 <= global_slot_idx < num_slots:
-            raise ValueError(
-                f"Invalid global slot: {global_slot_idx}"
-            )
-
-        sf_idx , slot_idx = divmod(
-            global_slot_idx,
-            num_slot_per_subframe
+    num_csi_samples = (
+        num_subframe_per_frame // CSI_SAMPLE_PERIOD_SUBFRAMES
+    )
+    for csi_sample_idx in range(num_csi_samples):
+        global_slot_idx = (
+            FDM_PILOT_GLOBAL_SLOT
+            + csi_sample_idx * slots_per_csi_sample
         )
-
-        for sym_idx in virtual_pilot_symbols:
-            positions.append((tx_idx, sf_idx, slot_idx, sym_idx))
+        sf_idx, slot_idx = divmod(global_slot_idx, num_slot_per_subframe)
+        for tx_idx in range(num_tx_ant):
+            for sym_idx in range(first_symbol, last_symbol_exclusive):
+                positions.append((tx_idx, sf_idx, slot_idx, sym_idx))
 
     return positions
 
-def place_virtual_pilots(resource_maps, known_ref_seq):
+
+def place_virtual_pilots(resource_maps, known_ref_seq, params):
     resource_maps = np.asarray(resource_maps)
     known_ref_seq = np.asarray(known_ref_seq, dtype=np.complex64)
     expected_shape = (
@@ -98,29 +136,24 @@ def place_virtual_pilots(resource_maps, known_ref_seq):
             f"{(resource_maps.shape[-1],)}"
         )
 
-    virtual_pilot_positions = get_virtual_pilot_positions()
-    for tx_idx, global_slot_idx in enumerate(VIRTUAL_PILOT_GLOBAL_SLOTS):
-        sf_idx, slot_idx = divmod(
-            global_slot_idx,
-            num_slot_per_subframe,
-        )
+    positions = params["virtual_pilot_positions"]
 
-        # Symbol 0 is intentionally untouched: TX0's RFO reference was placed
-        # there by build_frame().  Only symbols 1..6 belong to the TDM pilot.
-        pilot_symbols = [
-            symbol_idx
-            for pilot_tx_idx, pilot_sf_idx, pilot_slot_idx, symbol_idx
-            in virtual_pilot_positions
-            if (
-                pilot_tx_idx == tx_idx
-                and pilot_sf_idx == sf_idx
-                and pilot_slot_idx == slot_idx
-            )
-        ]
-        resource_maps[:, sf_idx, slot_idx, pilot_symbols, :] = 0
+    # Clear every pilot-bearing OFDM symbol once before placing per-TX pilots.
+    for sf_idx, slot_idx, symbol_idx in {
+        position[1:] for position in positions
+    }:
+        resource_maps[:, sf_idx, slot_idx, symbol_idx, :] = 0
+
+    active_indices = params["fdm_pilot_active_indices"]
+    for tx_idx, sf_idx, slot_idx, symbol_idx in positions:
+        active_idx = active_indices[tx_idx]
         resource_maps[
-            tx_idx, sf_idx, slot_idx, pilot_symbols, :
-        ] = known_ref_seq[None, :]
+            tx_idx,
+            sf_idx,
+            slot_idx,
+            symbol_idx,
+            active_idx,
+        ] = known_ref_seq[active_idx]
 
     return resource_maps
 
@@ -146,27 +179,27 @@ def phase_align_channel_estimates(h_virtual_pilots):
     aligned = h_virtual_pilots * np.exp(-1j * common_phases[..., None])
     return aligned.astype(np.complex64), common_phases.astype(np.float32)
 
-def pilot_snr_db_from_equalized(equalized_pilots_fd, known_ref_seq):
-    """Estimate pilot-domain SNR while preserving receiver axes.
-
-    The first axis contains repeated pilots and the last axis contains
-    subcarriers. Any axes between them (currently the RX antenna axis) are
-    retained in the returned SNR array.
-    """
-    equalized_pilots_fd = np.asarray(equalized_pilots_fd)
-    if equalized_pilots_fd.size == 0:
-        return 0.0
-    known_ref_seq = np.asarray(known_ref_seq, dtype=np.complex64)
-    reference_shape = (1,) * (equalized_pilots_fd.ndim - 1) + (-1,)
-    equalized_unit = equalized_pilots_fd / known_ref_seq.reshape(reference_shape)
-    mse = np.mean(
-        np.abs(equalized_unit - 1.0) ** 2,
-        axis=(0, equalized_pilots_fd.ndim - 1),
+def _symbol_useful_center_sample(
+    global_slot_idx,
+    symbol_idx,
+    *,
+    slot_length,
+    fft_size,
+    first_cp_length,
+    normal_cp_length,
+):
+    slot_start = global_slot_idx * slot_length
+    if symbol_idx == 0:
+        return slot_start + first_cp_length + fft_size / 2
+    return (
+        slot_start
+        + first_cp_length
+        + fft_size
+        + (symbol_idx - 1) * (normal_cp_length + fft_size)
+        + normal_cp_length
+        + fft_size / 2
     )
-    snr_db = np.asarray(10.0 * np.log10(1.0 / (mse + 1e-15)), dtype=np.float32)
-    if snr_db.ndim == 0:
-        return float(snr_db)
-    return snr_db
+
 
 def get_system_params(bandwidth_mhz):
     N, FFT_SIZE = bandwidth_options[bandwidth_mhz]
@@ -182,6 +215,34 @@ def get_system_params(bandwidth_mhz):
         + first_CP_length
     )
     frame_length = slot_length * num_slot_per_subframe * num_subframe_per_frame
+
+    virtual_pilot_positions = get_virtual_pilot_positions()
+    num_csi_samples = (
+        num_subframe_per_frame // CSI_SAMPLE_PERIOD_SUBFRAMES
+    )
+    pilot_offsets = np.empty(
+        (num_csi_samples, num_tx_ant, NUM_VIRTUAL_PILOTS),
+        dtype=np.float64,
+    )
+    pilot_offsets.fill(np.nan)
+    counts = np.zeros((num_csi_samples, num_tx_ant), dtype=np.int64)
+    for tx_idx, sf_idx, slot_idx, symbol_idx in virtual_pilot_positions:
+        csi_sample_idx = sf_idx // CSI_SAMPLE_PERIOD_SUBFRAMES
+        repetition = counts[csi_sample_idx, tx_idx]
+        global_slot_idx = sf_idx * num_slot_per_subframe + slot_idx
+        pilot_offsets[csi_sample_idx, tx_idx, repetition] = (
+            _symbol_useful_center_sample(
+                global_slot_idx,
+                symbol_idx,
+                slot_length=slot_length,
+                fft_size=FFT_SIZE,
+                first_cp_length=first_CP_length,
+                normal_cp_length=normal_CP_length,
+            )
+        )
+        counts[csi_sample_idx, tx_idx] += 1
+    if np.any(counts != NUM_VIRTUAL_PILOTS) or np.any(~np.isfinite(pilot_offsets)):
+        raise ValueError("Every TX must have all repeated pilot timestamps")
 
     return {
         "bandwidth_mhz": bandwidth_mhz,
@@ -207,7 +268,21 @@ def get_system_params(bandwidth_mhz):
         "num_rx_ant": num_rx_ant,
         "N_PSS": N_PSS,
         "num_virtual_pilots": NUM_VIRTUAL_PILOTS,
-        "virtual_pilot_positions": get_virtual_pilot_positions(),
+        "num_csi_samples_per_frame": num_csi_samples,
+        "csi_sample_period_subframes": CSI_SAMPLE_PERIOD_SUBFRAMES,
+        "csi_sample_period_s": CSI_SAMPLE_PERIOD_SUBFRAMES * 1e-3,
+        "virtual_pilot_positions": virtual_pilot_positions,
+        "fdm_pilot_centered_bins": tuple(FDM_PILOT_CENTERED_BINS),
+        "fdm_pilot_active_indices": get_fdm_pilot_active_indices(N),
+        "pilot_timestamp_offsets_samples_by_tx": pilot_offsets.tolist(),
+        "pilot_timestamp_offsets_samples": np.mean(
+            pilot_offsets,
+            axis=1,
+        ).tolist(),
+        "csi_sample_timestamp_offsets_samples": np.mean(
+            pilot_offsets,
+            axis=(1, 2),
+        ).tolist(),
         "phase_align_virtual_pilots": PHASE_ALIGN_VIRTUAL_PILOTS,
         "sync_tx_idx": SYNC_TX_IDX
     }
