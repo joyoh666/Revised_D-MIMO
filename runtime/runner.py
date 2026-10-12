@@ -1,9 +1,15 @@
+import argparse
 from multiprocessing import freeze_support, get_context
+from pathlib import Path
+from typing import Sequence
 
 from config.radio_config import (
     BANDWIDTH,
+    CSI_SEQUENCE_LENGTH,
     CLOCK_SOURCE,
+    NUM_CHANNEL_CAPTURES,
     OTW_FORMAT,
+    OUTPUT_DIR,
     REFERENCE_SEQUENCE_SEED,
     RX_ANTENNA,
     RX_CHANNELS,
@@ -34,9 +40,14 @@ from .transmitter import transmit_frames
 def _wait_for_processes(processes) -> bool:
     """Wait for the workers and return whether the user interrupted the run."""
     try:
-        while all(process.is_alive() for process in processes):
+        while any(process.is_alive() for process in processes):
             for process in processes:
                 process.join(timeout=0.25)
+            if any(
+                process.exitcode not in (None, 0)
+                for process in processes
+            ):
+                break
     except KeyboardInterrupt:
         print("Stopping runtime processes...")
         return True
@@ -59,17 +70,50 @@ def _stop_processes(processes, stop_event) -> None:
         process.join()
 
 
-def main() -> None:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Collect and save simultaneous 6-TX/1-RX channel sounding CSI."
+    )
+    parser.add_argument(
+        "--captures",
+        type=int,
+        default=NUM_CHANNEL_CAPTURES,
+        help="Number of 5 ms CSI snapshots to save.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(OUTPUT_DIR),
+        help="Directory for NPZ, JSON, and plot artifacts.",
+    )
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=CSI_SEQUENCE_LENGTH,
+        help="CSI samples per sequence; must be a positive multiple of 5.",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Save NPZ and JSON only.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_args(argv)
+    if args.captures <= 0:
+        raise ValueError("--captures must be greater than zero")
+    if args.sequence_length <= 0 or args.sequence_length % 5:
+        raise ValueError("--sequence-length must be a positive multiple of 5")
+    if args.captures < args.sequence_length:
+        raise ValueError("--captures must be at least --sequence-length")
+
     # Use spawn so that UHD is initialized only in the hardware child
     # processes. TX and RX rendezvous before scheduling a common start time.
     context = get_context("spawn")
     frame_queue = context.Queue(maxsize=2)
     samples_queue = context.Queue(maxsize=8)
-    # These are the hand-off points to the two inference workers. They are
-    # deliberately independent because predictor input arrives every 25 ms,
-    # while scheduler input arrives every 100 ms.
-    predictor_input_queue = context.Queue(maxsize=8)
-    scheduler_input_queue = context.Queue(maxsize=4)
     start_time_queue = context.Queue(maxsize=1)
     stop_event = context.Event()
     receiver_ready_event = context.Event()
@@ -143,8 +187,8 @@ def main() -> None:
         target=process_received_blocks,
         kwargs={
             "samples_queue": samples_queue,
-            "predictor_input_queue": predictor_input_queue,
-            "scheduler_input_queue": scheduler_input_queue,
+            "predictor_input_queue": None,
+            "scheduler_input_queue": None,
             "stop_event": stop_event,
             "params": params,
             "ss_td_with_cp": reference_frame["ss_td_with_cp"],
@@ -153,6 +197,11 @@ def main() -> None:
             "trailing_samples": int(
                 params["sampling_rate"] * RX_TRAILING_TIME
             ),
+            "max_csi_frames": args.captures,
+            "capture_output_dir": args.output_dir,
+            "reference_sequence_seed": reference_sequence_seed,
+            "save_capture_plots": not args.no_plots,
+            "sequence_length": args.sequence_length,
         },
     )
     processes = (postprocessor, producer, receiver, transmitter)
@@ -170,8 +219,6 @@ def main() -> None:
         for process_queue in (
             frame_queue,
             samples_queue,
-            predictor_input_queue,
-            scheduler_input_queue,
             start_time_queue,
         ):
             process_queue.close()

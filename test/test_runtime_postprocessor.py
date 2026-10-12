@@ -1,6 +1,8 @@
 import queue
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -63,6 +65,66 @@ class RuntimePostprocessorTests(unittest.TestCase):
         )
         self.assertTrue(scheduler_input_queue.empty())
         self.assertTrue(stop_event.is_set())
+
+    def test_saves_five_six_tx_captures_as_one_sequence(self):
+        params = get_system_params(1.4)
+        reference_seed = 2040
+        known_ref_seq = generate_known_reference_sequence(
+            params["N"],
+            reference_seed,
+        )
+        frame = build_frame(params, known_ref_seq)
+        rx_frame = np.sum(frame["waveform"], axis=0, keepdims=True)
+
+        samples_queue = queue.Queue()
+        for block_id in range(6):
+            samples_queue.put(
+                RXBlock(
+                    block_id=block_id,
+                    samples=rx_frame,
+                    first_sample_time=1.0 + block_id * 0.005,
+                    dropped_blocks=0,
+                )
+            )
+
+        stop_event = threading.Event()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            process_received_blocks(
+                samples_queue=samples_queue,
+                stop_event=stop_event,
+                params=params,
+                ss_td_with_cp=frame["ss_td_with_cp"],
+                pdsch_idx=frame["pdsch_idx"],
+                known_ref_seq=known_ref_seq,
+                max_csi_frames=5,
+                trailing_samples=1920,
+                capture_output_dir=temporary_directory,
+                reference_sequence_seed=reference_seed,
+                save_capture_plots=False,
+                sequence_length=5,
+            )
+
+            output_dir = Path(temporary_directory)
+            npz_paths = list(output_dir.glob("*.npz"))
+            json_paths = list(output_dir.glob("*.json"))
+            self.assertEqual(len(npz_paths), 1)
+            self.assertEqual(len(json_paths), 1)
+            with np.load(npz_paths[0], allow_pickle=False) as saved:
+                self.assertEqual(saved["csi"].shape, (5, 6))
+                self.assertEqual(saved["csi_sequences"].shape, (1, 5, 6))
+                np.testing.assert_array_equal(
+                    saved["csi_sequences"][0],
+                    saved["csi"],
+                )
+                self.assertEqual(saved["rx_block_ids"].tolist(), list(range(5)))
+                self.assertEqual(saved["rx_dropped_blocks"].tolist(), [0] * 5)
+                self.assertTrue(
+                    np.all(np.isfinite(saved["csi_timestamps_usrp_s"]))
+                )
+                self.assertTrue(
+                    np.all(np.isfinite(saved["pilot_timestamps_usrp_s"]))
+                )
+            self.assertTrue(stop_event.is_set())
 
 
 if __name__ == "__main__":

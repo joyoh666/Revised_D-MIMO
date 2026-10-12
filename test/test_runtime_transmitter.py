@@ -13,6 +13,7 @@ class FakeTXMetadata:
     def __init__(self):
         self.has_time_spec = False
         self.time_spec = None
+        self.start_of_burst = False
         self.end_of_burst = False
 
 
@@ -39,6 +40,7 @@ class FakeStreamer:
                 "samples": samples.copy(),
                 "has_time_spec": metadata.has_time_spec,
                 "time_spec": metadata.time_spec,
+                "start_of_burst": metadata.start_of_burst,
                 "end_of_burst": metadata.end_of_burst,
             }
         )
@@ -87,7 +89,7 @@ class USRPTransmitterTests(unittest.TestCase):
     def test_transmits_tx_frame_and_sends_end_of_burst(self):
         stop_event = threading.Event()
         frame_queue = queue.Queue()
-        samples = np.ones((2, 8), dtype=np.complex64)
+        samples = np.ones((6, 8), dtype=np.complex64)
         frame_queue.put(TXFrame(frame_id=7, samples=samples))
 
         streamer = FakeStreamer(stop_event)
@@ -98,7 +100,7 @@ class USRPTransmitterTests(unittest.TestCase):
             carrier_frequency=2.2e9,
             sampling_rate=1.92e6,
             gain=30,
-            channels=(0, 1),
+            channels=tuple(range(6)),
             transmission_delay=0.2,
             stop_event=stop_event,
             otw_format="sc16",
@@ -107,14 +109,19 @@ class USRPTransmitterTests(unittest.TestCase):
 
         transmitter.run()
 
-        self.assertEqual(usrp.gains, [(30, 0), (30, 1)])
+        self.assertEqual(
+            usrp.gains,
+            [(30, channel) for channel in range(6)],
+        )
         self.assertEqual(len(streamer.calls), 2)
         data_call, end_call = streamer.calls
         np.testing.assert_array_equal(data_call["samples"], samples)
         self.assertTrue(data_call["has_time_spec"])
         self.assertAlmostEqual(data_call["time_spec"].seconds, 10.2)
+        self.assertTrue(data_call["start_of_burst"])
         self.assertFalse(data_call["end_of_burst"])
-        self.assertEqual(end_call["samples"].shape, (2, 0))
+        self.assertFalse(end_call["start_of_burst"])
+        self.assertEqual(end_call["samples"].shape, (6, 0))
         self.assertTrue(end_call["end_of_burst"])
 
 

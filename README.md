@@ -63,6 +63,31 @@ floor with a clear safety area and verify that Space stops it.
 6-TX 채널 사운딩 프레임이다. 원본 학습 데이터와 호환되는 FDM pilot만
 사용한다.
 
+## 채널 사운딩 실행
+
+기본 하드웨어 경로는 RU USRP 3대를 하나의 6채널 TX streamer로 묶고, UE
+USRP는 별도의 1채널 RX streamer로 연다. 네 장비는 공통 외부 clock/PPS를
+사용하며 첫 송수신 시각을 맞춘다. 다음 명령은 5 ms CSI snapshot 1000개를
+수집하여 NPZ와 JSON, 진단 그림을 저장한다.
+
+```bash
+.venv/bin/python -m runtime.runner \
+  --captures 1000 \
+  --sequence-length 20 \
+  --output-dir saved_channel_estimates
+```
+
+그림이 필요하지 않으면 `--no-plots`를 추가한다. 저장된 기본 `csi` 배열의
+shape은 `(T, 6)`이고 `csi_sequences`는 `(N, L, 6)`이다. 여기서 `L`은
+`--sequence-length`로 지정하는 양수인 5의 배수이며, 연속 구간마다 겹치지 않는
+윈도우를 만든다. 따라서 수신 block 누락 전후의 CSI를 같은 시퀀스로 묶지 않고,
+각 연속 구간 끝에서 `L`보다 짧게 남은 샘플은 시퀀스 배열에서 제외한다. 원시
+`csi`에는 그대로 남으며, 어떤 행이 사용되었는지는
+`csi_sequence_dataset_row_indices`로 확인할 수 있다. 반복 pilot, RX block 번호,
+dropped-block 누계, USRP 기준 CSI/pilot timestamp도 함께 저장된다. `main.py`는
+이전 단일-process capture 경로이므로 분산 3-RU/1-UE 측정에는
+`runtime.runner`를 사용한다.
+
 ## 6-TX 프레임 구조
 
 ![6개 송신 안테나의 OFDM 심볼 배치](docs/figures/tx_frame_layout.png)
@@ -140,10 +165,11 @@ PSS[m] = exp(-j × pi × 25 × m × (m + 1) / 62),  m = 0, ..., 61
 csi.shape = (time, tx) = (time, 6)
 ```
 
-## 실시간 모델 입력 경로
+## CSI 후처리와 모델 입력 경로
 
-실시간 경로에서는 학습 데이터용 NPZ를 만들지 않는다. 채널 추정기가 출력한
-5 ms CSI 벡터 하나를 예측기 버퍼와 스케줄러 버퍼에 동시에 복사한다.
+채널 사운딩 실행에서는 채널 추정기가 출력한 5 ms CSI 벡터를 누적하여
+NPZ/JSON으로 저장한다. 예측기와 스케줄러 queue를 명시적으로 연결한 실시간
+실행에서는 같은 CSI 벡터를 두 모델 버퍼에도 동시에 복사할 수 있다.
 
 ```text
 5 ms CSI (6,)
@@ -187,11 +213,15 @@ csi_scalar_raw.shape
 
 ## 저장 결과와 메타데이터
 
-`results.py`가 저장하는 결과 스키마는 version 4이다. 모델 학습용 기본 배열은
-원본과 같은 `time → TX` 순서다.
+`results.py`가 저장하는 결과 스키마는 version 5이다. 원시 CSI와 시퀀스형
+모델 입력을 모두 저장한다.
 
 ```text
 csi = (time, tx)
+csi_sequences = (sequence, sequence_time, tx)
+csi_sequence_dataset_row_indices = (sequence, sequence_time)
+csi_sequence_period_indices = (sequence, sequence_time)
+csi_sequence_timestamps_usrp_s = (sequence, sequence_time)
 csi_repetitions = (time, virtual_pilot, tx)
 csi_repetitions_aligned = (time, virtual_pilot, tx)
 pilot_received = (time, virtual_pilot, tx)
@@ -218,8 +248,12 @@ channel_impulse_response_td
 ```
 
 NPZ에는 원본 호환 CSI뿐 아니라 pilot별 원본/위상 정렬 채널, single-pilot
-기준 채널, SNR, 분산, 지연 응답을 함께 저장한다. FDM 모드에서 상세 full-band
-배열은 scalar CSI를 주파수 평탄 채널로 broadcast한 값이다. JSON 메타데이터와 NPZ 내부
+기준 채널, SNR, 분산, 지연 응답을 함께 저장한다. narrowband `csi`는 상세
+주파수 영역 추정치의 subcarrier 축을 복소 평균해 계산한다. 단, 현재 FDM
+pilot은 TX마다 하나의 subcarrier만 측정하고 그 scalar 추정치를 full-band에
+broadcast하므로, 현 구조에서 이 평균은 물리적으로 여러 subcarrier를 측정한
+평균과 동일하지 않다. 실제 다중-subcarrier 평균이 필요하면 TX별로 여러
+직교 pilot bin을 배정하도록 pilot map과 추정기를 확장해야 한다. JSON 메타데이터와 NPZ 내부
 `metadata_json`에는 각 배열의 축 이름(`array_axis_order`)과 실제 shape
 (`saved_array_shapes`), TX/RX 수, 프레임당 CSI sample 수, 5 ms sample 주기,
 FDM pilot bin이 기록된다.

@@ -11,7 +11,12 @@ from USRP.helper_functions import (
     get_system_params,
 )
 from USRP.postprocessing import postprocess
-from USRP.results import CaptureAccumulator, plot_results, save_results
+from USRP.results import (
+    CaptureAccumulator,
+    _build_csi_sequences,
+    plot_results,
+    save_results,
+)
 
 
 class ResultsSchemaTests(unittest.TestCase):
@@ -52,11 +57,11 @@ class ResultsSchemaTests(unittest.TestCase):
     def test_save_and_plot_preserve_capture_csi_rx_tx_axes(self):
         accumulator = CaptureAccumulator(self.params)
         received = self._synthetic_received()
-        accumulator.add(received)
-        accumulator.add(received)
+        for block_id in range(5):
+            accumulator.add(received, rx_block_id=block_id)
         results = accumulator.finalize()
 
-        captures = 2
+        captures = 5
         csi_samples = self.params["num_csi_samples_per_frame"]
         num_rx = self.params["num_rx_ant"]
         num_tx = self.params["num_tx_ant"]
@@ -84,6 +89,10 @@ class ResultsSchemaTests(unittest.TestCase):
             expected_grid_shape,
         )
         self.assertEqual(results["channel_mean_fd"].shape, expected_csi_shape)
+        np.testing.assert_allclose(
+            results["csi"],
+            np.mean(results["channel_mean_fd"], axis=-1),
+        )
         self.assertEqual(
             results["channel_estimates_fd_virtual_pilots"].shape,
             (
@@ -124,11 +133,18 @@ class ResultsSchemaTests(unittest.TestCase):
                 show=False,
             )
 
-            self.assertEqual(metadata["result_schema_version"], 4)
+            self.assertEqual(metadata["result_schema_version"], 5)
             self.assertEqual(metadata["pilot_multiplexing"], "fdm")
             self.assertEqual(metadata["num_transmit_antennas"], num_tx)
             self.assertEqual(metadata["num_csi_samples_per_frame"], csi_samples)
             self.assertEqual(metadata["csi_sample_period_ms"], 5.0)
+            self.assertEqual(metadata["csi_sequence_length"], 5)
+            self.assertEqual(metadata["num_csi_sequences"], 1)
+            self.assertEqual(metadata["num_csi_samples_used_in_sequences"], 5)
+            self.assertEqual(
+                metadata["num_csi_samples_discarded_from_sequences"],
+                0,
+            )
             self.assertEqual(
                 metadata["saved_csi_channel_shape"],
                 list(expected_csi_shape),
@@ -148,6 +164,11 @@ class ResultsSchemaTests(unittest.TestCase):
             self.assertEqual(saved_metadata, metadata)
             with np.load(npz_path, allow_pickle=False) as dataset:
                 self.assertEqual(dataset["csi"].shape, (captures, num_tx))
+                self.assertEqual(dataset["csi_sequences"].shape, (1, 5, num_tx))
+                np.testing.assert_array_equal(
+                    dataset["csi_sequences"][0],
+                    dataset["csi"],
+                )
                 self.assertEqual(
                     dataset["csi_repetitions"].shape,
                     (captures, num_pilots, num_tx),
@@ -197,6 +218,54 @@ class ResultsSchemaTests(unittest.TestCase):
             for plot_path in plot_paths.values():
                 self.assertTrue(plot_path.is_file())
                 self.assertGreater(plot_path.stat().st_size, 0)
+
+    def test_sequence_builder_does_not_cross_period_gaps(self):
+        csi = np.arange(19 * 6, dtype=np.float32).reshape(19, 6).astype(
+            np.complex64
+        )
+        period_indices = np.concatenate(
+            (np.arange(7, dtype=np.int64), np.arange(10, 22, dtype=np.int64))
+        )
+        timestamps = period_indices.astype(np.float64) * 0.005
+
+        sequences = _build_csi_sequences(
+            csi,
+            period_indices,
+            timestamps,
+            sequence_length=5,
+        )
+
+        self.assertEqual(sequences["csi_sequences"].shape, (3, 5, 6))
+        np.testing.assert_array_equal(
+            sequences["csi_sequence_dataset_row_indices"],
+            np.asarray(
+                [
+                    [0, 1, 2, 3, 4],
+                    [7, 8, 9, 10, 11],
+                    [12, 13, 14, 15, 16],
+                ]
+            ),
+        )
+        self.assertTrue(
+            np.all(
+                np.diff(sequences["csi_sequence_period_indices"], axis=1)
+                == 1
+            )
+        )
+
+    def test_sequence_length_must_be_a_positive_multiple_of_five(self):
+        csi = np.empty((0, 6), dtype=np.complex64)
+        indices = np.empty((0,), dtype=np.int64)
+        timestamps = np.empty((0,), dtype=np.float64)
+        for invalid_length in (0, -5, 6):
+            with self.subTest(sequence_length=invalid_length):
+                with self.assertRaises(ValueError):
+                    _build_csi_sequences(
+                        csi,
+                        indices,
+                        timestamps,
+                        invalid_length,
+                    )
 
 if __name__ == "__main__":
     unittest.main()

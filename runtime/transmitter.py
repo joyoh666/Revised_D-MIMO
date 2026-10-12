@@ -63,6 +63,7 @@ class USRPTransmitter:
                 sent_total += num_sent
                 no_progress_count = 0
                 metadata.has_time_spec = False
+                metadata.start_of_burst = False
             else:
                 no_progress_count += 1
 
@@ -93,6 +94,7 @@ class USRPTransmitter:
 
     def run(self) -> None:
         metadata = self.uhd.types.TXMetadata()
+        metadata.start_of_burst = True
         first_frame = True
         failure = None
 

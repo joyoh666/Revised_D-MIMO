@@ -282,6 +282,25 @@ class CaptureAccumulator:
             if self.params.get("phase_align_virtual_pilots", False)
             else h_raw
         )
+        # The narrowband dataset keeps one complex coefficient per TX and
+        # time point.  Derive it from the frequency-domain estimate so this
+        # definition remains valid if the sounding pilot map is later
+        # expanded to cover multiple subcarriers per TX.
+        csi_narrowband = np.mean(h_mean, axis=-1).astype(
+            np.complex64,
+            copy=False,
+        )
+        selected_scalar_csi = (
+            csi_aligned
+            if self.params.get("phase_align_virtual_pilots", False)
+            else csi_raw
+        )
+        if csi_narrowband.shape != selected_scalar_csi.shape:
+            raise ValueError(
+                "Subcarrier-averaged CSI and scalar CSI must have equal "
+                f"shapes; got {csi_narrowband.shape} and "
+                f"{selected_scalar_csi.shape}"
+            )
         h_single_mean = h_virtual[:, :, :, 0, :]
 
         h_delay, h_full_spectrum = channel_to_delay_response(
@@ -338,9 +357,7 @@ class CaptureAccumulator:
         self._append("channel_mean_fd", h_mean, dtype=np.complex64)
         self._append(
             "csi",
-            csi_aligned
-            if self.params.get("phase_align_virtual_pilots", False)
-            else csi_raw,
+            csi_narrowband,
             dtype=np.complex64,
         )
         self._append(
@@ -751,6 +768,90 @@ def _original_compatible_arrays(
     }
 
 
+def _build_csi_sequences(
+    csi: Any,
+    period_indices: Any,
+    timestamps_usrp_s: Any,
+    sequence_length: int,
+) -> dict[str, np.ndarray]:
+    """Pack continuous narrowband CSI rows into non-overlapping sequences.
+
+    Incomplete tails are discarded independently for each continuous run, so
+    a sequence never bridges an RX block gap.
+    """
+    if sequence_length <= 0 or sequence_length % 5:
+        raise ValueError("sequence_length must be a positive multiple of 5")
+
+    csi_array = np.asarray(csi, dtype=np.complex64)
+    period_array = np.asarray(period_indices, dtype=np.int64)
+    timestamp_array = np.asarray(timestamps_usrp_s, dtype=np.float64)
+    if csi_array.ndim != 2:
+        raise ValueError(f"csi must have shape (time, tx); got {csi_array.shape}")
+    num_rows, num_tx = csi_array.shape
+    if period_array.shape != (num_rows,):
+        raise ValueError(
+            "period_indices must have shape (time,); "
+            f"got {period_array.shape}, expected ({num_rows},)"
+        )
+    if timestamp_array.shape != (num_rows,):
+        raise ValueError(
+            "timestamps_usrp_s must have shape (time,); "
+            f"got {timestamp_array.shape}, expected ({num_rows},)"
+        )
+
+    empty_sequence_shape = (0, sequence_length)
+    if num_rows == 0:
+        return {
+            "csi_sequences": np.empty(
+                (0, sequence_length, num_tx),
+                dtype=np.complex64,
+            ),
+            "csi_sequence_dataset_row_indices": np.empty(
+                empty_sequence_shape,
+                dtype=np.int64,
+            ),
+            "csi_sequence_period_indices": np.empty(
+                empty_sequence_shape,
+                dtype=np.int64,
+            ),
+            "csi_sequence_timestamps_usrp_s": np.empty(
+                empty_sequence_shape,
+                dtype=np.float64,
+            ),
+        }
+
+    run_starts = np.concatenate(
+        (
+            np.asarray([0], dtype=np.int64),
+            np.flatnonzero(np.diff(period_array) != 1).astype(np.int64) + 1,
+        )
+    )
+    run_ends = np.concatenate(
+        (run_starts[1:], np.asarray([num_rows], dtype=np.int64))
+    )
+    sequence_rows: list[np.ndarray] = []
+    for run_start, run_end in zip(run_starts, run_ends, strict=True):
+        usable_end = int(run_start) + (
+            (int(run_end) - int(run_start)) // sequence_length
+        ) * sequence_length
+        for start in range(int(run_start), usable_end, sequence_length):
+            sequence_rows.append(
+                np.arange(start, start + sequence_length, dtype=np.int64)
+            )
+
+    if sequence_rows:
+        row_indices = np.stack(sequence_rows, axis=0)
+    else:
+        row_indices = np.empty(empty_sequence_shape, dtype=np.int64)
+
+    return {
+        "csi_sequences": csi_array[row_indices],
+        "csi_sequence_dataset_row_indices": row_indices,
+        "csi_sequence_period_indices": period_array[row_indices],
+        "csi_sequence_timestamps_usrp_s": timestamp_array[row_indices],
+    }
+
+
 def save_results(
     output_dir: str | Path,
     params: dict[str, Any],
@@ -758,6 +859,7 @@ def save_results(
     results: dict[str, Any],
     *,
     reference_sequence_seed: int,
+    sequence_length: int = 5,
     timestamp: str | datetime | None = None,
 ) -> tuple[Path, Path, Path, dict[str, Any]]:
     """Save the capture dataset and its human-readable metadata."""
@@ -833,6 +935,14 @@ def save_results(
         known_ref_seq,
         results,
     )
+    compatible.update(
+        _build_csi_sequences(
+            compatible["csi"],
+            compatible["csi_period_indices"],
+            compatible["csi_timestamps_usrp_s"],
+            sequence_length,
+        )
+    )
 
     saved_result_keys = (
         "channel_estimates_fd",
@@ -874,10 +984,27 @@ def save_results(
     )
 
     metadata = {
-        "result_schema_version": 4,
+        "result_schema_version": 5,
         "array_axis_order": {
             "csi": ["time", "tx_antenna"],
             "csi_by_rx": ["time", "rx_antenna", "tx_antenna"],
+            "csi_sequences": [
+                "sequence",
+                "sequence_time",
+                "tx_antenna",
+            ],
+            "csi_sequence_dataset_row_indices": [
+                "sequence",
+                "sequence_time",
+            ],
+            "csi_sequence_period_indices": [
+                "sequence",
+                "sequence_time",
+            ],
+            "csi_sequence_timestamps_usrp_s": [
+                "sequence",
+                "sequence_time",
+            ],
             "csi_repetitions": [
                 "time",
                 "virtual_pilot",
@@ -1065,11 +1192,22 @@ def save_results(
         "num_csi_samples_per_frame": num_csi_samples,
         "pilot_multiplexing": "fdm",
         "primary_csi_array": "csi",
+        "primary_sequence_array": "csi_sequences",
         "primary_csi_interpretation": (
-            "one complex estimate per TX at its assigned FDM pilot bin"
+            "complex mean over the estimated subcarrier axis per TX and time"
         ),
         "fullband_csi_interpretation": (
-            "frequency-flat broadcast of the scalar FDM estimate"
+            "currently a frequency-flat broadcast of the scalar estimate "
+            "from the one assigned FDM pilot bin per TX"
+        ),
+        "csi_sequence_length": int(sequence_length),
+        "num_csi_sequences": int(compatible["csi_sequences"].shape[0]),
+        "num_csi_samples_used_in_sequences": int(
+            compatible["csi_sequences"].shape[0] * sequence_length
+        ),
+        "num_csi_samples_discarded_from_sequences": int(
+            compatible["csi"].shape[0]
+            - compatible["csi_sequences"].shape[0] * sequence_length
         ),
         "csi_sample_period_subframes": int(
             params["csi_sample_period_subframes"]
