@@ -71,20 +71,27 @@ USRP는 별도의 1채널 RX streamer로 연다. 네 장비는 공통 외부 clo
 수집하여 NPZ와 JSON, 진단 그림을 저장한다.
 
 ```bash
-.venv/bin/python -m runtime.runner \
-  --captures 1000 \
-  --sequence-length 20 \
+uv run python -m runtime.runner \
+  --duration-s 5 \
+  --window-length 20 \
   --output-dir saved_channel_estimates
 ```
 
+`--duration-s 5`는 5 ms 프레임 1000개를 의미한다. TX 프로세스는 송신을
+시작하기 전에 이 1000개 파형을 모두 생성해 메모리에 보관하며, 각 프레임의
+PDSCH 데이터는 서로 다르다. 동기화 신호와 채널 추정 pilot은 수신기가 알고
+있어야 하므로 고정된다. 기본값은 실행할 때마다 새로운 frame seed를 만들고,
+재현이 필요하면 `--frame-seed 1234`처럼 직접 지정할 수 있다. 1.4 MHz, 6-TX에서
+5초 파형이 차지하는 메모리는 약 439 MiB이다.
+
 그림이 필요하지 않으면 `--no-plots`를 추가한다. 저장된 기본 `csi` 배열의
-shape은 `(T, 6)`이고 `csi_sequences`는 `(N, L, 6)`이다. 여기서 `L`은
-`--sequence-length`로 지정하는 양수인 5의 배수이며, 연속 구간마다 겹치지 않는
-윈도우를 만든다. 따라서 수신 block 누락 전후의 CSI를 같은 시퀀스로 묶지 않고,
-각 연속 구간 끝에서 `L`보다 짧게 남은 샘플은 시퀀스 배열에서 제외한다. 원시
+shape은 `(T, 6)`이고 `csi_windows`는 `(W, L, 6)`이다. 여기서 `L`은
+`--window-length`로 지정하는 양수인 5의 배수이며, 연속 구간마다 겹치지 않는
+윈도우를 만든다. 따라서 수신 frame 누락 전후의 CSI를 같은 윈도우로 묶지 않고,
+각 연속 구간 끝에서 `L`보다 짧게 남은 샘플은 윈도우 배열에서 제외한다. 원시
 `csi`에는 그대로 남으며, 어떤 행이 사용되었는지는
-`csi_sequence_dataset_row_indices`로 확인할 수 있다. 반복 pilot, RX block 번호,
-dropped-block 누계, USRP 기준 CSI/pilot timestamp도 함께 저장된다. `main.py`는
+`csi_window_dataset_row_indices`로 확인할 수 있다. 반복 pilot, RX frame 번호,
+dropped-frame 누계, USRP 기준 CSI/pilot timestamp도 함께 저장된다. `main.py`는
 이전 단일-process capture 경로이므로 분산 3-RU/1-UE 측정에는
 `runtime.runner`를 사용한다.
 
@@ -183,7 +190,7 @@ NPZ/JSON으로 저장한다. 예측기와 스케줄러 queue를 명시적으로 
 100 ms 이득이다. 스케줄러 작업자는 이 값에 최근 3개 구간의 이력과 현재
 연결 상태 one-hot을 결합하여 최종 15차원 관측값을 만든다.
 
-윈도우에는 시작/끝 frame index와 host/USRP timestamp만 붙는다. RX block 또는
+윈도우에는 시작/끝 frame index와 host/USRP timestamp만 붙는다. RX frame 또는
 timestamp가 연속되지 않으면 두 부분 윈도우를 모두 비워 서로 다른 시간 구간의
 CSI가 한 모델 입력에 섞이지 않게 한다. 모델 입력 queue가 가득 찬 경우에는
 수신 루프를 멈추지 않고 오래된 입력을 버린 뒤 최신 입력을 유지한다.
@@ -213,15 +220,15 @@ csi_scalar_raw.shape
 
 ## 저장 결과와 메타데이터
 
-`results.py`가 저장하는 결과 스키마는 version 5이다. 원시 CSI와 시퀀스형
-모델 입력을 모두 저장한다.
+`results.py`가 저장하는 결과 스키마는 version 7이다. 후처리기가 완성한 원시
+CSI와 윈도우형 모델 입력을 저장한다.
 
 ```text
 csi = (time, tx)
-csi_sequences = (sequence, sequence_time, tx)
-csi_sequence_dataset_row_indices = (sequence, sequence_time)
-csi_sequence_period_indices = (sequence, sequence_time)
-csi_sequence_timestamps_usrp_s = (sequence, sequence_time)
+csi_windows = (window, window_sample, tx)
+csi_window_dataset_row_indices = (window, window_sample)
+csi_window_period_indices = (window, window_sample)
+csi_window_timestamps_usrp_s = (window, window_sample)
 csi_repetitions = (time, virtual_pilot, tx)
 csi_repetitions_aligned = (time, virtual_pilot, tx)
 pilot_received = (time, virtual_pilot, tx)
@@ -248,12 +255,15 @@ channel_impulse_response_td
 ```
 
 NPZ에는 원본 호환 CSI뿐 아니라 pilot별 원본/위상 정렬 채널, single-pilot
-기준 채널, SNR, 분산, 지연 응답을 함께 저장한다. narrowband `csi`는 상세
-주파수 영역 추정치의 subcarrier 축을 복소 평균해 계산한다. 단, 현재 FDM
-pilot은 TX마다 하나의 subcarrier만 측정하고 그 scalar 추정치를 full-band에
-broadcast하므로, 현 구조에서 이 평균은 물리적으로 여러 subcarrier를 측정한
-평균과 동일하지 않다. 실제 다중-subcarrier 평균이 필요하면 TX별로 여러
-직교 pilot bin을 배정하도록 pilot map과 추정기를 확장해야 한다. JSON 메타데이터와 NPZ 내부
+기준 채널, SNR, 분산, 지연 영역 진단값을 함께 저장한다. narrowband `csi`는
+각 TX branch에 할당된 FDM pilot subcarrier에서 측정한 scalar 계수를 반복
+pilot에 걸쳐 평균한 값이다. 이 값이 데이터셋의 기준 채널 계수다.
+
+`channel_mean_fd`와 다른 full-band 배열은 이 scalar 계수를 모든 active
+subcarrier에 복제한 결과이며, 여러 subcarrier에서 독립적으로 측정한 광대역
+채널이 아니다. 따라서 그 배열을 IFFT한 `channel_impulse_response_td`도 실제
+multipath CIR 측정값이 아니라 narrowband 가정을 표현하기 위한 진단용
+파생값이다. JSON 메타데이터와 NPZ 내부
 `metadata_json`에는 각 배열의 축 이름(`array_axis_order`)과 실제 shape
 (`saved_array_shapes`), TX/RX 수, 프레임당 CSI sample 수, 5 ms sample 주기,
 FDM pilot bin이 기록된다.

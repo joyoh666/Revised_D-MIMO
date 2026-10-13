@@ -201,8 +201,8 @@ class CaptureAccumulator:
         *,
         csi_timestamps_usrp_s: Any | None = None,
         pilot_timestamps_usrp_s: Any | None = None,
-        rx_block_id: int | None = None,
-        dropped_blocks: int | None = None,
+        rx_frame_id: int | None = None,
+        dropped_frames: int | None = None,
     ) -> None:
         """Add one dictionary returned by ``USRP.postprocessing.postprocess``."""
 
@@ -282,25 +282,19 @@ class CaptureAccumulator:
             if self.params.get("phase_align_virtual_pilots", False)
             else h_raw
         )
-        # The narrowband dataset keeps one complex coefficient per TX and
-        # time point.  Derive it from the frequency-domain estimate so this
-        # definition remains valid if the sounding pilot map is later
-        # expanded to cover multiple subcarriers per TX.
-        csi_narrowband = np.mean(h_mean, axis=-1).astype(
-            np.complex64,
-            copy=False,
-        )
+        # The paper treats the coefficient observed on each TX branch's
+        # assigned pilot subcarrier as that branch's narrowband channel.
+        # Keep that scalar estimate authoritative instead of deriving CSI
+        # from the synthetic full-band broadcast below.
         selected_scalar_csi = (
             csi_aligned
             if self.params.get("phase_align_virtual_pilots", False)
             else csi_raw
         )
-        if csi_narrowband.shape != selected_scalar_csi.shape:
-            raise ValueError(
-                "Subcarrier-averaged CSI and scalar CSI must have equal "
-                f"shapes; got {csi_narrowband.shape} and "
-                f"{selected_scalar_csi.shape}"
-            )
+        csi_narrowband = selected_scalar_csi.astype(
+            np.complex64,
+            copy=False,
+        )
         h_single_mean = h_virtual[:, :, :, 0, :]
 
         h_delay, h_full_spectrum = channel_to_delay_response(
@@ -495,13 +489,13 @@ class CaptureAccumulator:
             dtype=np.float64,
         )
         self._append(
-            "rx_block_ids",
-            -1 if rx_block_id is None else rx_block_id,
+            "rx_frame_ids",
+            -1 if rx_frame_id is None else rx_frame_id,
             dtype=np.int64,
         )
         self._append(
-            "rx_dropped_blocks",
-            -1 if dropped_blocks is None else dropped_blocks,
+            "rx_dropped_frames",
+            -1 if dropped_frames is None else dropped_frames,
             dtype=np.int64,
         )
 
@@ -703,14 +697,17 @@ def _original_compatible_arrays(
         results["pilot_timestamps_usrp_s"],
         dtype=np.float64,
     ).reshape(-1, num_pilots)
-    block_ids = np.asarray(results["rx_block_ids"], dtype=np.int64).reshape(-1)
-    dropped_blocks = np.asarray(
-        results["rx_dropped_blocks"],
+    frame_ids = np.asarray(
+        results["rx_frame_ids"],
         dtype=np.int64,
     ).reshape(-1)
-    if block_ids.size == captures and np.all(block_ids >= 0):
+    dropped_frames = np.asarray(
+        results["rx_dropped_frames"],
+        dtype=np.int64,
+    ).reshape(-1)
+    if frame_ids.size == captures and np.all(frame_ids >= 0):
         period_indices = (
-            (block_ids[:, None] - block_ids[0]) * csi_samples
+            (frame_ids[:, None] - frame_ids[0]) * csi_samples
             + np.arange(csi_samples, dtype=np.int64)[None, :]
         ).reshape(-1)
     else:
@@ -763,92 +760,8 @@ def _original_compatible_arrays(
         "repetition_phase_corrections_rad": phases[:, 0],
         "pilot_centered_bins": centered_bins,
         "pilot_active_subcarrier_indices": active_indices,
-        "rx_block_ids": np.repeat(block_ids, csi_samples),
-        "rx_dropped_blocks": np.repeat(dropped_blocks, csi_samples),
-    }
-
-
-def _build_csi_sequences(
-    csi: Any,
-    period_indices: Any,
-    timestamps_usrp_s: Any,
-    sequence_length: int,
-) -> dict[str, np.ndarray]:
-    """Pack continuous narrowband CSI rows into non-overlapping sequences.
-
-    Incomplete tails are discarded independently for each continuous run, so
-    a sequence never bridges an RX block gap.
-    """
-    if sequence_length <= 0 or sequence_length % 5:
-        raise ValueError("sequence_length must be a positive multiple of 5")
-
-    csi_array = np.asarray(csi, dtype=np.complex64)
-    period_array = np.asarray(period_indices, dtype=np.int64)
-    timestamp_array = np.asarray(timestamps_usrp_s, dtype=np.float64)
-    if csi_array.ndim != 2:
-        raise ValueError(f"csi must have shape (time, tx); got {csi_array.shape}")
-    num_rows, num_tx = csi_array.shape
-    if period_array.shape != (num_rows,):
-        raise ValueError(
-            "period_indices must have shape (time,); "
-            f"got {period_array.shape}, expected ({num_rows},)"
-        )
-    if timestamp_array.shape != (num_rows,):
-        raise ValueError(
-            "timestamps_usrp_s must have shape (time,); "
-            f"got {timestamp_array.shape}, expected ({num_rows},)"
-        )
-
-    empty_sequence_shape = (0, sequence_length)
-    if num_rows == 0:
-        return {
-            "csi_sequences": np.empty(
-                (0, sequence_length, num_tx),
-                dtype=np.complex64,
-            ),
-            "csi_sequence_dataset_row_indices": np.empty(
-                empty_sequence_shape,
-                dtype=np.int64,
-            ),
-            "csi_sequence_period_indices": np.empty(
-                empty_sequence_shape,
-                dtype=np.int64,
-            ),
-            "csi_sequence_timestamps_usrp_s": np.empty(
-                empty_sequence_shape,
-                dtype=np.float64,
-            ),
-        }
-
-    run_starts = np.concatenate(
-        (
-            np.asarray([0], dtype=np.int64),
-            np.flatnonzero(np.diff(period_array) != 1).astype(np.int64) + 1,
-        )
-    )
-    run_ends = np.concatenate(
-        (run_starts[1:], np.asarray([num_rows], dtype=np.int64))
-    )
-    sequence_rows: list[np.ndarray] = []
-    for run_start, run_end in zip(run_starts, run_ends, strict=True):
-        usable_end = int(run_start) + (
-            (int(run_end) - int(run_start)) // sequence_length
-        ) * sequence_length
-        for start in range(int(run_start), usable_end, sequence_length):
-            sequence_rows.append(
-                np.arange(start, start + sequence_length, dtype=np.int64)
-            )
-
-    if sequence_rows:
-        row_indices = np.stack(sequence_rows, axis=0)
-    else:
-        row_indices = np.empty(empty_sequence_shape, dtype=np.int64)
-
-    return {
-        "csi_sequences": csi_array[row_indices],
-        "csi_sequence_dataset_row_indices": row_indices,
-        "csi_sequence_period_indices": period_array[row_indices],
-        "csi_sequence_timestamps_usrp_s": timestamp_array[row_indices],
+        "rx_frame_ids": np.repeat(frame_ids, csi_samples),
+        "rx_dropped_frames": np.repeat(dropped_frames, csi_samples),
     }
 
 
@@ -859,7 +772,8 @@ def save_results(
     results: dict[str, Any],
     *,
     reference_sequence_seed: int,
-    sequence_length: int = 5,
+    tx_frame_seed: int | None = None,
+    window_length: int = 5,
     timestamp: str | datetime | None = None,
 ) -> tuple[Path, Path, Path, dict[str, Any]]:
     """Save the capture dataset and its human-readable metadata."""
@@ -935,14 +849,51 @@ def save_results(
         known_ref_seq,
         results,
     )
-    compatible.update(
-        _build_csi_sequences(
-            compatible["csi"],
-            compatible["csi_period_indices"],
-            compatible["csi_timestamps_usrp_s"],
-            sequence_length,
-        )
+    window_keys = (
+        "csi_windows",
+        "csi_window_dataset_row_indices",
+        "csi_window_period_indices",
+        "csi_window_timestamps_usrp_s",
     )
+    missing_window_keys = [key for key in window_keys if key not in results]
+    if missing_window_keys:
+        raise ValueError(
+            "postprocessor results are missing CSI window arrays: "
+            + ", ".join(missing_window_keys)
+        )
+    csi_windows = np.asarray(results["csi_windows"], dtype=np.complex64)
+    expected_window_index_shape = csi_windows.shape[:2]
+    if (
+        csi_windows.ndim != 3
+        or csi_windows.shape[1] != window_length
+        or csi_windows.shape[2] != num_transmit_antennas
+    ):
+        raise ValueError(
+            "csi_windows must have shape (window, window_length, tx); "
+            f"got {csi_windows.shape}"
+        )
+    window_arrays = {
+        "csi_windows": csi_windows,
+        "csi_window_dataset_row_indices": np.asarray(
+            results["csi_window_dataset_row_indices"],
+            dtype=np.int64,
+        ),
+        "csi_window_period_indices": np.asarray(
+            results["csi_window_period_indices"],
+            dtype=np.int64,
+        ),
+        "csi_window_timestamps_usrp_s": np.asarray(
+            results["csi_window_timestamps_usrp_s"],
+            dtype=np.float64,
+        ),
+    }
+    for name, array in tuple(window_arrays.items())[1:]:
+        if array.shape != expected_window_index_shape:
+            raise ValueError(
+                f"{name} has shape {array.shape}, expected "
+                f"{expected_window_index_shape}"
+            )
+    compatible.update(window_arrays)
 
     saved_result_keys = (
         "channel_estimates_fd",
@@ -960,8 +911,8 @@ def save_results(
         "pilot_noise_power",
         "csi_timestamps_usrp_s",
         "pilot_timestamps_usrp_s",
-        "rx_block_ids",
-        "rx_dropped_blocks",
+        "rx_frame_ids",
+        "rx_dropped_frames",
         "virtual_pilot_variance_raw",
         "virtual_pilot_variance_aligned",
         "virtual_pilot_common_phases_rad",
@@ -984,26 +935,26 @@ def save_results(
     )
 
     metadata = {
-        "result_schema_version": 5,
+        "result_schema_version": 7,
         "array_axis_order": {
             "csi": ["time", "tx_antenna"],
             "csi_by_rx": ["time", "rx_antenna", "tx_antenna"],
-            "csi_sequences": [
-                "sequence",
-                "sequence_time",
+            "csi_windows": [
+                "window",
+                "window_sample",
                 "tx_antenna",
             ],
-            "csi_sequence_dataset_row_indices": [
-                "sequence",
-                "sequence_time",
+            "csi_window_dataset_row_indices": [
+                "window",
+                "window_sample",
             ],
-            "csi_sequence_period_indices": [
-                "sequence",
-                "sequence_time",
+            "csi_window_period_indices": [
+                "window",
+                "window_sample",
             ],
-            "csi_sequence_timestamps_usrp_s": [
-                "sequence",
-                "sequence_time",
+            "csi_window_timestamps_usrp_s": [
+                "window",
+                "window_sample",
             ],
             "csi_repetitions": [
                 "time",
@@ -1028,6 +979,8 @@ def save_results(
             "pilot_noise_power": ["time", "virtual_pilot"],
             "csi_timestamps_usrp_s": ["time"],
             "pilot_timestamps_usrp_s": ["time", "virtual_pilot"],
+            "rx_frame_ids": ["time"],
+            "rx_dropped_frames": ["time"],
             "channel_estimates_fd": [
                 "capture",
                 "rx_antenna",
@@ -1192,22 +1145,37 @@ def save_results(
         "num_csi_samples_per_frame": num_csi_samples,
         "pilot_multiplexing": "fdm",
         "primary_csi_array": "csi",
-        "primary_sequence_array": "csi_sequences",
+        "primary_csi_source": (
+            "csi_scalar_aligned"
+            if params.get("phase_align_virtual_pilots", False)
+            else "csi_scalar_raw"
+        ),
+        "primary_window_array": "csi_windows",
         "primary_csi_interpretation": (
-            "complex mean over the estimated subcarrier axis per TX and time"
+            "per-TX narrowband channel coefficient observed on that TX "
+            "branch's assigned FDM pilot subcarrier and averaged over the "
+            "repeated pilot symbols"
         ),
+        "fullband_csi_is_measured": False,
         "fullband_csi_interpretation": (
-            "currently a frequency-flat broadcast of the scalar estimate "
-            "from the one assigned FDM pilot bin per TX"
+            "synthetic frequency-flat broadcast of the primary scalar CSI "
+            "from the one assigned FDM pilot subcarrier per TX; it is not "
+            "an independently measured wideband channel"
         ),
-        "csi_sequence_length": int(sequence_length),
-        "num_csi_sequences": int(compatible["csi_sequences"].shape[0]),
-        "num_csi_samples_used_in_sequences": int(
-            compatible["csi_sequences"].shape[0] * sequence_length
+        "delay_response_is_measured": False,
+        "delay_response_interpretation": (
+            "diagnostic IFFT of the synthetic frequency-flat broadcast; "
+            "it must not be interpreted as a measured multipath channel "
+            "impulse response"
         ),
-        "num_csi_samples_discarded_from_sequences": int(
+        "csi_window_length": int(window_length),
+        "num_csi_windows": int(compatible["csi_windows"].shape[0]),
+        "num_csi_samples_used_in_windows": int(
+            compatible["csi_windows"].shape[0] * window_length
+        ),
+        "num_csi_samples_discarded_from_windows": int(
             compatible["csi"].shape[0]
-            - compatible["csi_sequences"].shape[0] * sequence_length
+            - compatible["csi_windows"].shape[0] * window_length
         ),
         "csi_sample_period_subframes": int(
             params["csi_sample_period_subframes"]
@@ -1242,6 +1210,9 @@ def save_results(
         "samples_per_delay_response": params["FFT_SIZE"],
         "reference_sequence_type": "seeded_unit_power_qpsk",
         "reference_sequence_seed": int(reference_sequence_seed),
+        "tx_frame_seed": (
+            None if tx_frame_seed is None else int(tx_frame_seed)
+        ),
         "virtual_pilots_per_tx_per_csi_sample": num_virtual_pilots,
         "fdm_pilot_centered_bins": params["fdm_pilot_centered_bins"],
         "fdm_pilot_active_indices": params["fdm_pilot_active_indices"],
@@ -1508,8 +1479,8 @@ def plot_results(
     )
 
     _plot_rx_tx_lines(axes[0, 0], average_channel_magnitude)
-    axes[0, 0].set_title("Average |H[k]| across captures and CSI samples")
-    axes[0, 0].set_xlabel("Subcarrier index")
+    axes[0, 0].set_title("Frequency-flat |H[k]| broadcast (diagnostic)")
+    axes[0, 0].set_xlabel("Active subcarrier index (broadcast)")
     axes[0, 0].set_ylabel("Magnitude")
     axes[0, 0].grid(True, alpha=0.3)
 
@@ -1522,13 +1493,13 @@ def plot_results(
         origin="lower",
         interpolation="nearest",
     )
-    axes[0, 1].set_title("Mean-link |H[k]| over captures and CSI samples")
-    axes[0, 1].set_xlabel("Subcarrier index")
+    axes[0, 1].set_title("Frequency-flat mean-link |H[k]| (diagnostic)")
+    axes[0, 1].set_xlabel("Active subcarrier index (broadcast)")
     axes[0, 1].set_ylabel("Capture × CSI sample index")
     summary_figure.colorbar(image, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
     _plot_rx_tx_lines(axes[0, 2], average_delay_magnitude)
-    axes[0, 2].set_title("Average |h[n]| in delay domain")
+    axes[0, 2].set_title("IFFT of narrowband broadcast (not measured CIR)")
     axes[0, 2].set_xlabel("Delay sample")
     axes[0, 2].set_ylabel("Magnitude")
     axes[0, 2].grid(True, alpha=0.3)
@@ -1591,7 +1562,7 @@ def plot_results(
         label_suffix=f" {num_virtual_pilots}-pilot average",
         linestyle="--",
     )
-    delay_axes[0].set_title("Delay-domain mean profile")
+    delay_axes[0].set_title("Diagnostic IFFT profile (not measured CIR)")
     delay_axes[0].set_xlabel("Delay sample")
     delay_axes[0].set_ylabel("Magnitude")
     delay_axes[0].grid(True, alpha=0.3)
@@ -1628,10 +1599,10 @@ def plot_results(
         ha="right",
     )
     delay_axes[1].set_ylabel("Residual suppression gain (dB)")
-    delay_axes[1].set_title("Single-pilot to averaged delay residual gain")
+    delay_axes[1].set_title("Diagnostic IFFT residual comparison")
     delay_axes[1].grid(True, axis="y", alpha=0.3)
     delay_figure.suptitle(
-        "Delay profile comparison | "
+        "Narrowband-broadcast IFFT diagnostic | not a measured CIR | "
         f"mean residual suppression={np.mean(flattened_gain):.2f} dB"
     )
     delay_figure.tight_layout(rect=(0, 0, 1, 0.94))

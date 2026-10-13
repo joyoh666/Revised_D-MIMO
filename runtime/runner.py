@@ -1,11 +1,13 @@
 import argparse
+import math
 from multiprocessing import freeze_support, get_context
 from pathlib import Path
+import secrets
 from typing import Sequence
 
 from config.radio_config import (
     BANDWIDTH,
-    CSI_SEQUENCE_LENGTH,
+    CSI_WINDOW_LENGTH,
     CLOCK_SOURCE,
     NUM_CHANNEL_CAPTURES,
     OTW_FORMAT,
@@ -31,10 +33,9 @@ from USRP.helper_functions import (
     get_system_params,
 )
 
-from .frame_producer import frame_producer
-from .postprocessor import process_received_blocks
-from .receiver import receive_blocks
-from .transmitter import transmit_frames
+from .postprocessor import process_received_frames
+from .receiver import receive_frames
+from .transmitter import transmit_precomputed_frames
 
 
 def _wait_for_processes(processes) -> bool:
@@ -74,11 +75,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect and save simultaneous 6-TX/1-RX channel sounding CSI."
     )
-    parser.add_argument(
+    capture_group = parser.add_mutually_exclusive_group()
+    capture_group.add_argument(
         "--captures",
         type=int,
-        default=NUM_CHANNEL_CAPTURES,
+        default=None,
         help="Number of 5 ms CSI snapshots to save.",
+    )
+    capture_group.add_argument(
+        "--duration-s",
+        type=float,
+        default=None,
+        help="Transmit duration in seconds; must be a multiple of 5 ms.",
     )
     parser.add_argument(
         "--output-dir",
@@ -87,10 +95,21 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Directory for NPZ, JSON, and plot artifacts.",
     )
     parser.add_argument(
+        "--window-length",
         "--sequence-length",
+        dest="window_length",
         type=int,
-        default=CSI_SEQUENCE_LENGTH,
-        help="CSI samples per sequence; must be a positive multiple of 5.",
+        default=CSI_WINDOW_LENGTH,
+        help="CSI samples per window; must be a positive multiple of 5.",
+    )
+    parser.add_argument(
+        "--frame-seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed for random PDSCH frames. By default a new seed is generated "
+            "for every run."
+        ),
     )
     parser.add_argument(
         "--no-plots",
@@ -100,27 +119,62 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_num_captures(args: argparse.Namespace, csi_period_s: float) -> int:
+    if args.duration_s is not None:
+        if args.duration_s <= 0:
+            raise ValueError("--duration-s must be greater than zero")
+        exact_frame_count = args.duration_s / csi_period_s
+        num_captures = round(exact_frame_count)
+        if not math.isclose(
+            exact_frame_count,
+            num_captures,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "--duration-s must be a multiple of the CSI period "
+                f"({csi_period_s * 1e3:g} ms)"
+            )
+        return num_captures
+
+    return (
+        NUM_CHANNEL_CAPTURES
+        if args.captures is None
+        else args.captures
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    if args.captures <= 0:
+    bandwidth_mhz = BANDWIDTH
+    params = get_system_params(bandwidth_mhz)
+    num_captures = _resolve_num_captures(
+        args,
+        float(params["csi_sample_period_s"]),
+    )
+    if num_captures <= 0:
         raise ValueError("--captures must be greater than zero")
-    if args.sequence_length <= 0 or args.sequence_length % 5:
-        raise ValueError("--sequence-length must be a positive multiple of 5")
-    if args.captures < args.sequence_length:
-        raise ValueError("--captures must be at least --sequence-length")
+    if args.window_length <= 0 or args.window_length % 5:
+        raise ValueError("--window-length must be a positive multiple of 5")
+    if num_captures < args.window_length:
+        raise ValueError("--captures must be at least --window-length")
+    frame_seed = (
+        secrets.randbits(63)
+        if args.frame_seed is None
+        else args.frame_seed
+    )
+    if frame_seed < 0:
+        raise ValueError("--frame-seed must be non-negative")
 
     # Use spawn so that UHD is initialized only in the hardware child
     # processes. TX and RX rendezvous before scheduling a common start time.
     context = get_context("spawn")
-    frame_queue = context.Queue(maxsize=2)
-    samples_queue = context.Queue(maxsize=8)
+    frames_queue = context.Queue(maxsize=8)
     start_time_queue = context.Queue(maxsize=1)
     stop_event = context.Event()
     receiver_ready_event = context.Event()
     sync_barrier = context.Barrier(2)
 
-    bandwidth_mhz = BANDWIDTH
-    params = get_system_params(bandwidth_mhz)
     reference_sequence_seed = (
         REFERENCE_SEQUENCE_SEED + int(10 * bandwidth_mhz)
     )
@@ -132,16 +186,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     # single reference frame supplies all postprocessing workers with them.
     reference_frame = build_frame(params, known_ref_seq)
 
-    producer = context.Process(
-        name="frame-producer",
-        target=frame_producer,
-        args=(frame_queue, stop_event, params, known_ref_seq),
-    )
     receiver = context.Process(
         name="usrp-receiver",
-        target=receive_blocks,
+        target=receive_frames,
         kwargs={
-            "samples_queue": samples_queue,
+            "frames_queue": frames_queue,
             "stop_event": stop_event,
             "device_args": RX_USRP_DEVICE_ARGS,
             "rx_subdev_spec": RX_SUBDEV_SPEC,
@@ -162,10 +211,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     transmitter = context.Process(
         name="usrp-transmitter",
-        target=transmit_frames,
+        target=transmit_precomputed_frames,
         kwargs={
-            "frame_queue": frame_queue,
             "stop_event": stop_event,
+            "params": params,
+            "known_ref_seq": known_ref_seq,
+            "num_frames": num_captures,
+            "frame_seed": frame_seed,
             "device_args": TX_USRP_DEVICE_ARGS,
             "tx_subdev_spec": TX_SUBDEV_SPEC,
             "tx_antenna": TX_ANTENNA,
@@ -184,9 +236,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     postprocessor = context.Process(
         name="csi-postprocessor",
-        target=process_received_blocks,
+        target=process_received_frames,
         kwargs={
-            "samples_queue": samples_queue,
+            "frames_queue": frames_queue,
             "predictor_input_queue": None,
             "scheduler_input_queue": None,
             "stop_event": stop_event,
@@ -197,14 +249,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             "trailing_samples": int(
                 params["sampling_rate"] * RX_TRAILING_TIME
             ),
-            "max_csi_frames": args.captures,
+            "max_csi_frames": num_captures,
             "capture_output_dir": args.output_dir,
             "reference_sequence_seed": reference_sequence_seed,
+            "tx_frame_seed": frame_seed,
             "save_capture_plots": not args.no_plots,
-            "sequence_length": args.sequence_length,
+            "window_length": args.window_length,
         },
     )
-    processes = (postprocessor, producer, receiver, transmitter)
+    processes = (postprocessor, receiver, transmitter)
     started_processes = []
     interrupted = False
 
@@ -217,8 +270,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     finally:
         _stop_processes(started_processes, stop_event)
         for process_queue in (
-            frame_queue,
-            samples_queue,
+            frames_queue,
             start_time_queue,
         ):
             process_queue.close()

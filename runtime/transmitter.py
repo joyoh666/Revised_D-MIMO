@@ -1,13 +1,46 @@
-from queue import Empty, Full
+from queue import Full
 
 import numpy as np
+
+from USRP.build_frame import build_frame
+
+
+def build_precomputed_frames(
+    params,
+    known_ref_seq,
+    *,
+    num_frames,
+    frame_seed,
+):
+    """Build every random-PDSCH frame before transmission begins."""
+    if num_frames <= 0:
+        raise ValueError("num_frames must be greater than zero")
+
+    num_tx = int(params["num_tx_ant"])
+    frame_length = int(params["frame_length"])
+    frames = np.empty(
+        (num_frames, num_tx, frame_length),
+        dtype=np.complex64,
+    )
+    rng = np.random.default_rng(frame_seed)
+    for frame_idx in range(num_frames):
+        frame = build_frame(params, known_ref_seq, rng=rng)
+        waveform = np.asarray(frame["waveform"], dtype=np.complex64)
+        if waveform.shape != (num_tx, frame_length):
+            raise ValueError(
+                f"precomputed frame {frame_idx} has shape {waveform.shape}, "
+                f"expected {(num_tx, frame_length)}"
+            )
+        frames[frame_idx] = waveform
+
+    return frames
 
 
 class USRPTransmitter:
     def __init__(
         self,
         usrp,
-        frame_queue,
+        frames,
         carrier_frequency,
         sampling_rate,
         gain,
@@ -24,7 +57,18 @@ class USRPTransmitter:
 
         self.uhd = uhd_module
         self.usrp = usrp
-        self.frame_queue = frame_queue
+        self.frames = np.asarray(frames, dtype=np.complex64)
+        if self.frames.ndim != 3:
+            raise ValueError(
+                "frames must have shape (frame, num_channels, num_samples)"
+            )
+        if self.frames.shape[0] == 0 or self.frames.shape[2] == 0:
+            raise ValueError("frames must contain at least one non-empty frame")
+        if self.frames.shape[1] != len(channels):
+            raise ValueError(
+                f"frames have {self.frames.shape[1]} channel(s), but "
+                f"{len(channels)} channel(s) were configured"
+            )
         self.carrier_frequency = carrier_frequency
         self.sampling_rate = sampling_rate
         self.channels = channels
@@ -99,26 +143,13 @@ class USRPTransmitter:
         failure = None
 
         try:
-            while not self.stop_event.is_set():
-                try:
-                    tx_frame = self.frame_queue.get(timeout=0.2)
-                except Empty:
-                    continue
-
+            for frame_idx in range(self.frames.shape[0]):
+                if self.stop_event.is_set():
+                    break
                 samples = np.ascontiguousarray(
-                    tx_frame.samples,
+                    self.frames[frame_idx],
                     dtype=np.complex64,
                 )
-                if samples.ndim != 2:
-                    raise ValueError(
-                        "TX frame samples must have shape "
-                        "(num_channels, num_samples)"
-                    )
-                if samples.shape[0] != len(self.channels):
-                    raise ValueError(
-                        f"TX frame has {samples.shape[0]} channel(s), but "
-                        f"{len(self.channels)} channel(s) were configured"
-                    )
                 if first_frame:
                     transmission_time = self.transmission_time
                     if transmission_time is None:
@@ -153,10 +184,13 @@ class USRPTransmitter:
             raise failure
 
 
-def transmit_frames(
+def transmit_precomputed_frames(
     *,
-    frame_queue,
     stop_event,
+    params,
+    known_ref_seq,
+    num_frames,
+    frame_seed,
     device_args,
     tx_subdev_spec,
     tx_antenna,
@@ -172,7 +206,7 @@ def transmit_frames(
     receiver_ready_event=None,
     start_time_queue=None,
 ) -> None:
-    """Initialize UHD and transmit queued frames inside the child process."""
+    """Precompute the finite frame batch, then transmit it continuously."""
     try:
         from USRP.usrp_utils import initialize_tx_usrp
 
@@ -193,9 +227,28 @@ def transmit_frames(
             else:
                 return
 
+        memory_mib = (
+            int(num_frames)
+            * int(params["num_tx_ant"])
+            * int(params["frame_length"])
+            * np.dtype(np.complex64).itemsize
+            / (1024**2)
+        )
+        print(
+            f"Precomputing {num_frames} TX frames with seed {frame_seed} "
+            f"({memory_mib:.1f} MiB)..."
+        )
+        frames = build_precomputed_frames(
+            params,
+            known_ref_seq,
+            num_frames=num_frames,
+            frame_seed=frame_seed,
+        )
+        print("TX frame precomputation complete; starting transmission.")
+
         transmitter = USRPTransmitter(
             usrp=usrp,
-            frame_queue=frame_queue,
+            frames=frames,
             carrier_frequency=carrier_frequency,
             sampling_rate=sampling_rate,
             gain=gain,

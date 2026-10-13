@@ -10,6 +10,7 @@ import numpy as np
 
 from config.radio_config import (
     CAPTURE_BANDWIDTHS,
+    CSI_WINDOW_LENGTH,
     NUM_CHANNEL_CAPTURES,
     NUM_VIRTUAL_PILOTS,
     OTW_FORMAT,
@@ -33,6 +34,7 @@ from USRP.helper_functions import (
 )
 from USRP.postprocessing import postprocess
 from USRP.results import CaptureAccumulator, plot_results, save_results
+from runtime.postprocessor import build_csi_windows_from_results
 
 
 CaptureFunction = Callable[[Any, np.ndarray, dict[str, Any]], np.ndarray]
@@ -205,6 +207,9 @@ def run_capture_experiment(
             num_captures=num_captures,
             capture_function=capture_function,
         )
+        results.update(
+            build_csi_windows_from_results(results, CSI_WINDOW_LENGTH)
+        )
 
         npz_path, json_path, figure_path, metadata = save_results(
             output_dir,
@@ -212,6 +217,7 @@ def run_capture_experiment(
             known_ref_seq,
             results,
             reference_sequence_seed=reference_seed,
+            window_length=CSI_WINDOW_LENGTH,
         )
         plot_paths = plot_results(
             figure_path,

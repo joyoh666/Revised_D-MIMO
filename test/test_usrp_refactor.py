@@ -23,6 +23,7 @@ from USRP.helper_functions import (
 from USRP.ofdm import ofdm_demodulate
 from USRP.postprocessing import postprocess
 from USRP.results import CaptureAccumulator, plot_results, save_results
+from runtime.postprocessor import build_csi_windows_from_results
 
 
 class USRPRefactorTests(unittest.TestCase):
@@ -83,7 +84,9 @@ class USRPRefactorTests(unittest.TestCase):
         accumulator = CaptureAccumulator(cls.params)
         for _ in range(cls.NUM_CAPTURES):
             accumulator.add(cls.received)
-        return accumulator.finalize()
+        results = accumulator.finalize()
+        results.update(build_csi_windows_from_results(results, 5))
+        return results
 
     def test_build_frame_waveform_and_ofdm_round_trip(self):
         waveform = self.frame_objects["waveform"]

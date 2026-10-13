@@ -5,20 +5,20 @@ import numpy as np
 
 
 @dataclass
-class RXBlock:
-    """One complete block of samples captured from the UE USRP."""
+class RXFrame:
+    """One complete 5 ms radio frame captured from the UE USRP."""
 
-    block_id: int
+    frame_id: int
     samples: np.ndarray
     first_sample_time: float | None
-    dropped_blocks: int
+    dropped_frames: int
 
 
 class USRPReceiver:
     def __init__(
         self,
         usrp,
-        samples_queue,
+        frames_queue,
         num_samples,
         carrier_frequency,
         sampling_rate,
@@ -48,7 +48,7 @@ class USRPReceiver:
 
         self.uhd = uhd_module
         self.usrp = usrp
-        self.samples_queue = samples_queue
+        self.frames_queue = frames_queue
         self.num_samples = int(num_samples)
         self.carrier_frequency = carrier_frequency
         self.sampling_rate = sampling_rate
@@ -58,7 +58,7 @@ class USRPReceiver:
         self.stop_event = stop_event
         self.recv_timeout = recv_timeout
         self.max_consecutive_timeouts = max_consecutive_timeouts
-        self.dropped_blocks = 0
+        self.dropped_frames = 0
 
         self.gain = (
             [gain] * len(self.channels)
@@ -93,8 +93,8 @@ class USRPReceiver:
             return None
         return float(metadata.time_spec.get_real_secs())
 
-    def receive_samples(self, metadata):
-        """Receive one complete block, or return ``None`` when stopping."""
+    def receive_frame(self, metadata):
+        """Receive one complete radio frame, or ``None`` when stopping."""
         num_channels = len(self.channels)
         packet_buffer = np.empty(
             (num_channels, self.max_samples_per_packet),
@@ -158,29 +158,29 @@ class USRPReceiver:
 
         return samples, first_sample_time
 
-    def _enqueue_block(
+    def _enqueue_frame(
         self,
-        block_id,
+        frame_id,
         samples,
         first_sample_time,
     ) -> bool:
-        """Queue the newest block without stalling the hardware RX loop."""
+        """Queue the newest frame without stalling the hardware RX loop."""
         while not self.stop_event.is_set():
-            block = RXBlock(
-                block_id=block_id,
+            frame = RXFrame(
+                frame_id=frame_id,
                 samples=samples,
                 first_sample_time=first_sample_time,
-                dropped_blocks=self.dropped_blocks,
+                dropped_frames=self.dropped_frames,
             )
             try:
-                self.samples_queue.put(block, timeout=0.05)
+                self.frames_queue.put(frame, timeout=0.05)
                 return True
             except Full:
                 try:
-                    self.samples_queue.get_nowait()
+                    self.frames_queue.get_nowait()
                 except Empty:
                     continue
-                self.dropped_blocks += 1
+                self.dropped_frames += 1
 
         return False
 
@@ -208,20 +208,20 @@ class USRPReceiver:
             self._start_stream()
             stream_started = True
 
-            block_id = 0
+            frame_id = 0
             while not self.stop_event.is_set():
-                received = self.receive_samples(metadata)
+                received = self.receive_frame(metadata)
                 if received is None:
                     break
 
                 samples, first_sample_time = received
-                if not self._enqueue_block(
-                    block_id,
+                if not self._enqueue_frame(
+                    frame_id,
                     samples,
                     first_sample_time,
                 ):
                     break
-                block_id += 1
+                frame_id += 1
         except KeyboardInterrupt:
             self.stop_event.set()
         except Exception as exc:
@@ -240,9 +240,9 @@ class USRPReceiver:
             raise failure
 
 
-def receive_blocks(
+def receive_frames(
     *,
-    samples_queue,
+    frames_queue,
     stop_event,
     device_args,
     rx_subdev_spec,
@@ -260,7 +260,7 @@ def receive_blocks(
     receiver_ready_event=None,
     start_time_queue=None,
 ) -> None:
-    """Initialize the UE USRP and receive blocks inside a child process."""
+    """Initialize the UE USRP and receive frames inside a child process."""
     try:
         import uhd
         from USRP.usrp_utils import initialize_rx_usrp
@@ -278,7 +278,7 @@ def receive_blocks(
 
         receiver = USRPReceiver(
             usrp=usrp,
-            samples_queue=samples_queue,
+            frames_queue=frames_queue,
             num_samples=num_samples,
             carrier_frequency=carrier_frequency,
             sampling_rate=sampling_rate,
@@ -310,6 +310,6 @@ def receive_blocks(
         stop_event.set()
         raise
     finally:
-        cancel_join = getattr(samples_queue, "cancel_join_thread", None)
+        cancel_join = getattr(frames_queue, "cancel_join_thread", None)
         if cancel_join is not None:
             cancel_join()

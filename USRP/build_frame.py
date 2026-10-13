@@ -4,7 +4,7 @@ from USRP.modulate import modulate
 import numpy as np
 from .ofdm import ofdm_modulate
 
-def build_frame(params, known_ref_seq):
+def build_frame(params, known_ref_seq, *, rng=None):
     N = params["N"]
     modulation_order = params["modulation_order"]
     num_subframe_per_frame = params["num_subframe_per_frame"]
@@ -50,12 +50,21 @@ def build_frame(params, known_ref_seq):
     pdsch_idx = np.where(resource_maps == PDSCH_PLACEHOLDER)
     num_data_symbols = pdsch_idx[0].size
 
-    data_bits = np.random.randint(
-        0,
-        2,
-        num_data_symbols * int(np.log2(modulation_order)),
-        dtype=np.uint8
-    )
+    num_data_bits = num_data_symbols * int(np.log2(modulation_order))
+    if rng is None:
+        data_bits = np.random.randint(
+            0,
+            2,
+            num_data_bits,
+            dtype=np.uint8,
+        )
+    else:
+        data_bits = rng.integers(
+            0,
+            2,
+            num_data_bits,
+            dtype=np.uint8,
+        )
     iq = modulate(data_bits, modulation_order)
 
     resource_maps[pdsch_idx] = iq
