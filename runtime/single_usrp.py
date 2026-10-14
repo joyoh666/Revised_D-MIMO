@@ -1,4 +1,4 @@
-"""Single-X310, simultaneous TX/RX sounding worker.
+"""Single-X310, simultaneous 2-TX/1-RX sounding worker.
 
 One MultiUSRP object is shared by TX and RX streamers. A receiver thread runs
 concurrently with timed TX streaming; only the postprocessor is a subprocess.
@@ -39,14 +39,12 @@ def capture_single_usrp(
     # trailing samples without attempting to extend a finished TX burst.
     guard = np.zeros_like(frames[:1])
     frames = np.concatenate((frames, guard), axis=0)
-    start_time = usrp.get_time_now().get_real_secs() + start_delay
-
     receiver = USRPReceiver(
         usrp=usrp, frames_queue=frames_queue,
         num_samples=int(params["frame_length"]),
         carrier_frequency=params["carrier_frequency"],
         sampling_rate=params["sampling_rate"], gain=rx_gain,
-        channels=tuple(rx_channels), start_time=start_time,
+        channels=tuple(rx_channels), start_time=None,
         otw_format=otw_format, stop_event=stop_event,
         recv_timeout=0.5, max_consecutive_timeouts=10, uhd_module=uhd,
     )
@@ -55,9 +53,15 @@ def capture_single_usrp(
         carrier_frequency=params["carrier_frequency"],
         sampling_rate=params["sampling_rate"], gain=tx_gain,
         channels=list(tx_channels), transmission_delay=start_delay,
-        transmission_time=start_time, stop_event=stop_event,
+        transmission_time=None, stop_event=stop_event,
         otw_format=otw_format, uhd_module=uhd,
     )
+    # Schedule the common hardware timestamp only AFTER tuning and streamer
+    # creation; those operations can otherwise consume the timing lead.
+    start_time = usrp.get_time_now().get_real_secs() + start_delay
+    receiver.start_time = start_time
+    transmitter.transmission_time = start_time
+
     errors = []
     def collect():
         try:
