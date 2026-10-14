@@ -34,6 +34,7 @@ from USRP.helper_functions import (
 )
 
 from .postprocessor import process_received_frames
+from .single_usrp import capture_single_usrp
 from .receiver import receive_frames
 from .transmitter import transmit_precomputed_frames
 
@@ -186,33 +187,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     # single reference frame supplies all postprocessing workers with them.
     reference_frame = build_frame(params, known_ref_seq)
 
-    receiver = context.Process(
-        name="usrp-receiver",
-        target=receive_frames,
+    hardware = context.Process(
+        name="x310-single-usrp",
+        target=capture_single_usrp,
         kwargs={
             "frames_queue": frames_queue,
-            "stop_event": stop_event,
-            "device_args": RX_USRP_DEVICE_ARGS,
-            "rx_subdev_spec": RX_SUBDEV_SPEC,
-            "rx_antenna": RX_ANTENNA,
-            "num_samples": params["frame_length"],
-            "carrier_frequency": params["carrier_frequency"],
-            "sampling_rate": params["sampling_rate"],
-            "gain": Rx_gain,
-            "channels": RX_CHANNELS,
-            "start_time": None,
-            "otw_format": OTW_FORMAT,
-            "clock_source": CLOCK_SOURCE,
-            "time_source": TIME_SOURCE,
-            "sync_barrier": sync_barrier,
-            "receiver_ready_event": receiver_ready_event,
-            "start_time_queue": start_time_queue,
-        },
-    )
-    transmitter = context.Process(
-        name="usrp-transmitter",
-        target=transmit_precomputed_frames,
-        kwargs={
             "stop_event": stop_event,
             "params": params,
             "known_ref_seq": known_ref_seq,
@@ -220,18 +199,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             "frame_seed": frame_seed,
             "device_args": TX_USRP_DEVICE_ARGS,
             "tx_subdev_spec": TX_SUBDEV_SPEC,
+            "rx_subdev_spec": RX_SUBDEV_SPEC,
             "tx_antenna": TX_ANTENNA,
-            "carrier_frequency": params["carrier_frequency"],
-            "sampling_rate": params["sampling_rate"],
-            "gain": Tx_gain,
-            "channels": TX_CHANNELS,
+            "rx_antenna": RX_ANTENNA,
+            "tx_channels": TX_CHANNELS,
+            "rx_channels": RX_CHANNELS,
+            "tx_gain": Tx_gain,
+            "rx_gain": Rx_gain,
             "otw_format": OTW_FORMAT,
-            "transmission_delay": WAIT_TIME,
-            "clock_source": CLOCK_SOURCE,
-            "time_source": TIME_SOURCE,
-            "sync_barrier": sync_barrier,
-            "receiver_ready_event": receiver_ready_event,
-            "start_time_queue": start_time_queue,
         },
     )
     postprocessor = context.Process(
@@ -257,7 +232,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "window_length": args.window_length,
         },
     )
-    processes = (postprocessor, receiver, transmitter)
+    processes = (postprocessor, hardware)
     started_processes = []
     interrupted = False
 
