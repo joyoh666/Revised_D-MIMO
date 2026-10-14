@@ -34,16 +34,19 @@ VIRTUAL_PILOT_SYMBOL_START = 1
 # The aligned repetitions are still saved as a separate diagnostic array.
 PHASE_ALIGN_VIRTUAL_PILOTS = False
 SYNC_TX_IDX = 0
-# All six antennas transmit three FDM pilots in the same OFDM symbols, each
-# on its own subcarrier.
+# Each enabled TX antenna transmits on its own subcarrier.  Keep the complete
+# three-RU allocation here and select only the bins needed by ``num_RU``.
 FDM_PILOT_GLOBAL_SLOT = 1
-FDM_PILOT_CENTERED_BINS = (-30, -18, -6, 6, 18, 30)
+ALL_FDM_PILOT_CENTERED_BINS = (-30, -18, -6, 6, 18, 30)
 normal_CP_time = 4.7e-6
 first_CP_time = 5.2e-6
 N_PSS = 62
-num_RU = 3
+num_RU = 1
 num_tx_ant_per_RU = 2
+if num_RU not in (1, 2, 3):
+    raise ValueError("num_RU must be 1, 2, or 3")
 num_tx_ant = num_RU * num_tx_ant_per_RU
+FDM_PILOT_CENTERED_BINS = ALL_FDM_PILOT_CENTERED_BINS[:num_tx_ant]
 num_rx_ant = 1
 num_symbols_per_slot = 7
 num_slot_per_subframe = 2
@@ -61,17 +64,35 @@ channel_gains_db = [0, -3, -10, -15]
 POWER = 4
 modulation_order = 4
 
-USRP_DEVICE_ARGS = (
-    "addr0=192.168.10.2,addr1=192.168.11.2,"
-    "addr2=192.168.12.2,addr3=192.168.13.2"
+RU_USRP_ADDRESSES = (
+    "192.168.10.2",
+    "192.168.11.2",
+    "192.168.12.2",
 )
-# The runtime pipeline opens the three RU radios and the UE radio in separate
-# processes. UHD multi-device argument keys must be indexed as addr0, addr1,
-# and so on; a single device uses addr.
+RX_USRP_ADDRESS = "192.168.13.2"
+SELECTED_RU_USRP_ADDRESSES = RU_USRP_ADDRESSES[:num_RU]
+
+# The runtime pipeline opens the selected RU radios and the UE radio in
+# separate processes. UHD uses ``addr`` for one device and indexed ``addrN``
+# keys when several devices form one MultiUSRP.
 TX_USRP_DEVICE_ARGS = (
-    "addr0=192.168.10.2,addr1=192.168.11.2,addr2=192.168.12.2"
+    f"addr={SELECTED_RU_USRP_ADDRESSES[0]}"
+    if num_RU == 1
+    else ",".join(
+        f"addr{index}={address}"
+        for index, address in enumerate(SELECTED_RU_USRP_ADDRESSES)
+    )
 )
-RX_USRP_DEVICE_ARGS = "addr=192.168.13.2"
+RX_USRP_DEVICE_ARGS = f"addr={RX_USRP_ADDRESS}"
+
+# Legacy single-process device list retained for ``main.py``.  New captures
+# should use ``python -m runtime.runner``, which uses the TX/RX arguments above.
+USRP_DEVICE_ARGS = ",".join(
+    f"addr{index}={address}"
+    for index, address in enumerate(
+        SELECTED_RU_USRP_ADDRESSES + (RX_USRP_ADDRESS,)
+    )
+)
 CLOCK_SOURCE = "external"
 TIME_SOURCE = "external"
 TX_SUBDEV_SPEC = "A:0 B:0"
