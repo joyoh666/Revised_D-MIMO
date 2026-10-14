@@ -8,7 +8,6 @@ from typing import Sequence
 from config.radio_config import (
     BANDWIDTH,
     CSI_WINDOW_LENGTH,
-    CLOCK_SOURCE,
     NUM_CHANNEL_CAPTURES,
     OTW_FORMAT,
     OUTPUT_DIR,
@@ -16,16 +15,13 @@ from config.radio_config import (
     RX_ANTENNA,
     RX_CHANNELS,
     RX_SUBDEV_SPEC,
-    RX_USRP_DEVICE_ARGS,
     RX_TRAILING_TIME,
     Rx_gain,
-    TIME_SOURCE,
     TX_ANTENNA,
     TX_CHANNELS,
     TX_SUBDEV_SPEC,
     TX_USRP_DEVICE_ARGS,
     Tx_gain,
-    WAIT_TIME,
 )
 from USRP.build_frame import build_frame
 from USRP.helper_functions import (
@@ -35,8 +31,6 @@ from USRP.helper_functions import (
 
 from .postprocessor import process_received_frames
 from .single_usrp import capture_single_usrp
-from .receiver import receive_frames
-from .transmitter import transmit_precomputed_frames
 
 
 def _wait_for_processes(processes) -> bool:
@@ -74,7 +68,7 @@ def _stop_processes(processes, stop_event) -> None:
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Collect and save simultaneous 6-TX/1-RX channel sounding CSI."
+        description="Collect 2-TX/1-RX CSI on one X310 every 5 ms."
     )
     capture_group = parser.add_mutually_exclusive_group()
     capture_group.add_argument(
@@ -167,14 +161,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if frame_seed < 0:
         raise ValueError("--frame-seed must be non-negative")
 
-    # Use spawn so that UHD is initialized only in the hardware child
-    # processes. TX and RX rendezvous before scheduling a common start time.
+    # Only the hardware subprocess initializes UHD; both TX/RX streamers
+    # share a single X310 instance and use one scheduled device timestamp.
     context = get_context("spawn")
     frames_queue = context.Queue(maxsize=8)
-    start_time_queue = context.Queue(maxsize=1)
     stop_event = context.Event()
-    receiver_ready_event = context.Event()
-    sync_barrier = context.Barrier(2)
 
     reference_sequence_seed = (
         REFERENCE_SEQUENCE_SEED + int(10 * bandwidth_mhz)
@@ -244,10 +235,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         interrupted = _wait_for_processes(processes)
     finally:
         _stop_processes(started_processes, stop_event)
-        for process_queue in (
-            frames_queue,
-            start_time_queue,
-        ):
+        for process_queue in (frames_queue,):
             process_queue.close()
             process_queue.join_thread()
 
