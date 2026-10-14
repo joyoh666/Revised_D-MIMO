@@ -1,7 +1,7 @@
 import numpy as np
 
 carrier_frequency = 2.2e9
-Tx_gain, Rx_gain = 30, 30
+Tx_gain, Rx_gain = 0, 10
 
 # Capture settings
 BANDWIDTH = 1.4
@@ -42,7 +42,7 @@ normal_CP_time = 4.7e-6
 first_CP_time = 5.2e-6
 N_PSS = 62
 num_RU = 1
-num_tx_ant_per_RU = 2
+num_tx_ant_per_RU = 1
 if num_RU not in (1, 2, 3):
     raise ValueError("num_RU must be 1, 2, or 3")
 num_tx_ant = num_RU * num_tx_ant_per_RU
@@ -65,11 +65,11 @@ POWER = 4
 modulation_order = 4
 
 RU_USRP_ADDRESSES = (
-    "192.168.10.2",
+    "192.168.70.3",
     "192.168.11.2",
     "192.168.12.2",
 )
-RX_USRP_ADDRESS = "192.168.13.2"
+RX_USRP_ADDRESS = "192.168.70.3"
 SELECTED_RU_USRP_ADDRESSES = RU_USRP_ADDRESSES[:num_RU]
 
 # The runtime pipeline opens the selected RU radios and the UE radio in
@@ -93,15 +93,15 @@ USRP_DEVICE_ARGS = ",".join(
         SELECTED_RU_USRP_ADDRESSES + (RX_USRP_ADDRESS,)
     )
 )
-CLOCK_SOURCE = "external"
-TIME_SOURCE = "external"
+CLOCK_SOURCE = "internal"
+TIME_SOURCE = "internal"
 TX_SUBDEV_SPEC = "A:0 B:0"
-RX_SUBDEV_SPEC = "B:0"
+RX_SUBDEV_SPEC = "A:0 B:0"
 TX_ANTENNA = "TX/RX"
-RX_ANTENNA = "TX/RX"
+RX_ANTENNA = "RX2"
 TX_CHANNELS = tuple(range(num_tx_ant))
 # Add channels here for multi-RX capture; the DSP path preserves this axis.
-RX_CHANNELS = (0,)
+RX_CHANNELS = (1,)
 WAIT_TIME = 0.2
 TX_DELAY_TIME = 1e-4
 RX_TRAILING_TIME = 1e-3
