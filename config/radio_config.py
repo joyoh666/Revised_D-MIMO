@@ -34,15 +34,15 @@ VIRTUAL_PILOT_SYMBOL_START = 1
 # The aligned repetitions are still saved as a separate diagnostic array.
 PHASE_ALIGN_VIRTUAL_PILOTS = False
 SYNC_TX_IDX = 0
-# Each enabled TX antenna transmits on its own subcarrier.  Keep the complete
-# three-RU allocation here and select only the bins needed by ``num_RU``.
+# Each enabled TX antenna transmits on its own subcarrier. Keep the complete
+# three-RU allocation here and select the first num_tx_ant bins.
 FDM_PILOT_GLOBAL_SLOT = 1
 ALL_FDM_PILOT_CENTERED_BINS = (-30, -18, -6, 6, 18, 30)
 normal_CP_time = 4.7e-6
 first_CP_time = 5.2e-6
 N_PSS = 62
 num_RU = 1
-num_tx_ant_per_RU = 1
+num_tx_ant_per_RU = 2
 if num_RU not in (1, 2, 3):
     raise ValueError("num_RU must be 1, 2, or 3")
 num_tx_ant = num_RU * num_tx_ant_per_RU
@@ -72,9 +72,8 @@ RU_USRP_ADDRESSES = (
 RX_USRP_ADDRESS = "192.168.70.3"
 SELECTED_RU_USRP_ADDRESSES = RU_USRP_ADDRESSES[:num_RU]
 
-# The runtime pipeline opens the selected RU radios and the UE radio in
-# separate processes. UHD uses ``addr`` for one device and indexed ``addrN``
-# keys when several devices form one MultiUSRP.
+# Single-device capture uses one MultiUSRP, two TX channels (A and B), and
+# one RX channel (B RX2); the generic address generation is retained.
 TX_USRP_DEVICE_ARGS = (
     f"addr={SELECTED_RU_USRP_ADDRESSES[0]}"
     if num_RU == 1
@@ -85,8 +84,8 @@ TX_USRP_DEVICE_ARGS = (
 )
 RX_USRP_DEVICE_ARGS = f"addr={RX_USRP_ADDRESS}"
 
-# Legacy single-process device list retained for ``main.py``.  New captures
-# should use ``python -m runtime.runner``, which uses the TX/RX arguments above.
+# Legacy multi-device address list retained for older scripts. For the
+# single-X310 capture use TX_USRP_DEVICE_ARGS via runtime.runner.
 USRP_DEVICE_ARGS = ",".join(
     f"addr{index}={address}"
     for index, address in enumerate(
